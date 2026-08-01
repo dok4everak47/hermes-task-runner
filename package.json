@@ -1,0 +1,15 @@
+{
+  "name": "hermes-task-runner",
+  "version": "0.1.0",
+  "description": "Hermes Task Runner (htask): TASK.md → OpenCode 实现 → 验证 → REPORT.md 全链路自动化",
+  "type": "module",
+  "bin": {
+    "htask": "./bin/htask.mjs"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
