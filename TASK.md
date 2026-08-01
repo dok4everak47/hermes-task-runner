@@ -32,7 +32,7 @@ After: 每个任务有完整状态机 + 迁移历史 + 卡住检测 + 人工确�
 CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED
    │         │           │             │            │           │
    │         │           │             │            └─(fail)→ FAILED
-   │         │           │             └─(review fail)→ FAILED
+   │         │           │             └─(review 结果仅记录)→ VERIFYING
    │         │           └─(exit≠0)→ FAILED
    │         └─(解析失败)→ FAILED
    └─(任意非终态可)→ CANCELLED

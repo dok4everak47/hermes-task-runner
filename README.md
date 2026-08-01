@@ -18,7 +18,7 @@ ln -s "$(pwd)/bin/htask.mjs" /opt/homebrew/bin/htask
 CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED
    │         │           │             │            │           │
    │         │           │             │            └─(fail)→ FAILED
-   │         │           │             └─(review fail)→ FAILED
+   │         │           │             └─(review 结果仅记录)→ VERIFYING
    │         │           └─(exit≠0)→ FAILED
    │         └─(解析失败)→ FAILED
    └─(任意非终态可)→ CANCELLED
