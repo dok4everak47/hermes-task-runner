@@ -15,6 +15,10 @@ const DEFAULT_VERIFY = ['npm run typecheck', 'npm test', 'npm run build'];
 const VERIFY_TIMEOUT_MS = 600_000;
 const OUTPUT_LIMIT = 2000;
 
+// 内置保护: merge/advance 提交时排除的运行产物 (不依赖项目 .gitignore 配置)
+// 含 .htask/ 状态目录 — 任何项目用 htask 都不会把状态/日志/报告污染进 commit
+export const MERGE_EXCLUDE = ['REPORT.md', 'REVIEW.md', '.htask'];
+
 // ---------- 状态机核心 ----------
 
 export const STATES = [
@@ -715,6 +719,15 @@ export async function cmdAccept({ cwd, id }) {
 
 // ---------- 命令: merge ----------
 
+// 在 git add 后、commit 前取消暂存内置保护文件 (仅排除, 不删除工作区文件)。
+// git reset 不存在的文件也会 exit 0 (no-op), 无需检查存在性。
+function unstageExcluded(cwd) {
+  for (const f of MERGE_EXCLUDE) {
+    const r = spawnSync('git', ['reset', '--', f], { cwd, encoding: 'utf8' });
+    if (r.status !== 0) console.warn(`⚠️ git reset ${f} 失败 (已忽略): ${(r.stderr ?? '').trim()}`);
+  }
+}
+
 // git add/commit/push + transition MERGED, 供 cmdMerge / cmdAdvance 复用。
 // json 模式下进度消息走 stderr, 保持 stdout 只有 JSON。
 export async function doMerge(cwd, task, { noPush = false, by = 'human', json = false } = {}) {
@@ -726,16 +739,24 @@ export async function doMerge(cwd, task, { noPush = false, by = 'human', json = 
     process.exitCode = 1;
     return { ok: false, reason: 'commit-failed' };
   }
+  unstageExcluded(cwd);
   const commit = spawnSync('git', ['commit', '-m', String(task.title), '--no-verify'], {
     cwd,
     encoding: 'utf8',
   });
   if (commit.status !== 0) {
-    console.error(`❌ git commit 失败 (状态不变):\n${commit.stderr ?? commit.stdout ?? ''}`);
-    process.exitCode = 1;
-    return { ok: false, reason: 'commit-failed' };
+    const detail = (commit.stderr || commit.stdout || '').trim();
+    // 无代码改动 (工作树 clean) 不算失败: 任务仍算完成, 仅归档状态
+    if (/nothing to commit|no changes added to commit|nothing added to commit/i.test(detail)) {
+      console.warn('⚠️ 无代码改动 (工作树 clean), 仅归档任务状态');
+    } else {
+      console.error(`❌ git commit 失败 (状态不变):\n${detail}`);
+      process.exitCode = 1;
+      return { ok: false, reason: 'commit-failed' };
+    }
+  } else {
+    out(`✅ git commit: ${task.title}`);
   }
-  out(`✅ git commit: ${task.title}`);
 
   await transition(cwd, task.id, 'MERGED', by);
 

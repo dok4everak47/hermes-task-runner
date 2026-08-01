@@ -1,164 +1,69 @@
-# TASK — htask JSON 输出 + advance 自动推进（Hermes 编排集成）
+# TASK — htask merge 内置报告文件保护
 
 ## Goal
 
-让 Hermes（外部编排者）能**程序化读取** htask 任务状态并**自动推进**任务，实现"读状态 → 分诊 → 介入"的 orchestrator 闭环。
+让 `htask advance` / `htask merge` 的 git commit **自动排除报告文件**（REPORT.md / REVIEW.md），不依赖项目 `.gitignore` 配置——任何项目用它都不会把运行产物污染进仓库。
 
-Before: htask 输出是给人看的文本，Hermes 无法可靠解析；自动推进只能靠人肉敲 accept/merge。
-After: `htask list --json` / `htask status --json` 输出机器可读状态；`htask advance` 自动推进可自动的迁移（验证全绿 → ACCEPTED → MERGED）；Hermes 可据此自动介入。
+Before: `git add -A` 会把 REPORT.md/REVIEW.md 一起提交（cron 自动推进时实测踩坑，靠 revert 清理）。
+After: merge 前自动 `git reset` 掉报告文件，commit 只含代码 + TASK.md。
 
 ## Context
 
-- 项目: ~/Project/hermes-task-runner（htask, 零依赖 node CLI, 当前 35 测试全绿）
-- 现有状态机: CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED，人工闸门在 VERIFYING→ACCEPTED（accept）与 ACCEPTED→MERGED（merge）
-- 现有命令: start/status/report/accept/merge/cancel/list
-- 状态文件: `.htask/tasks/<id>.json`（含 status/history/verify 等）, `.htask/state.json` 存 currentId 指针
-- 用户工作流第④⑤步: Hermes 独立验收 → commit+push（对应 accept → merge）
+- 项目: ~/Project/hermes-task-runner（htask, 零依赖 node CLI, 当前 47 测试全绿）
+- 触发背景: cron job 自动 advance 时，`git add -A` 提交了测试任务的 REPORT.md/TASK.md 进仓库（commit bccf15e），已 revert + 加 .gitignore 补救——但 .gitignore 是项目级配置，新项目可能忘加
+- 现有代码: `bin/htask.mjs` 的 `cmdMerge` / `cmdAdvance` 共用 git add/commit 逻辑
 
 ## Current Behavior
 
-- `htask status` / `htask list` 只输出人类可读文本（中文表格），无 `--json`
-- 自动推进需人工: 先 accept 再 merge 两条命令
-- Hermes 介入需要解析文本（脆弱）或自己读 JSON 文件（可行但散落各处）
+- `cmdMerge` 执行 `git add -A` → 全部文件进暂存区 → commit
+- 若项目没在 .gitignore 排除 REPORT.md/REVIEW.md，它们会被提交
 
 ## Expected Behavior
 
-### 1. `--json` 输出（status / list）
-
-`htask status --json`（无参=当前任务）:
-```json
-{
-  "id": "task-20260801-toolstats",
-  "title": "...",
-  "status": "VERIFYING",
-  "state": "WAITING_HUMAN",
-  "taskFile": "TASK.md",
-  "model": "deepseek/deepseek-v4-flash",
-  "agent": null,
-  "review": null,
-  "verification": { "typecheck": true, "test": true, "build": true },
-  "verify": [{ "command": "npm run typecheck", "exitCode": 0 }],
-  "historyCount": 5,
-  "startedAt": "...", "updatedAt": "...", "endedAt": null,
-  "stale": null,
-  "nextStep": "等待人工: htask accept"
-}
-```
-
-`htask list --json`:
-```json
-{
-  "tasks": [
-    { "id": "...", "title": "...", "status": "VERIFYING", "state": "WAITING_HUMAN", "updatedAt": "...", "stale": null, "nextStep": "..." }
-  ],
-  "summary": { "total": 1, "byStatus": { "VERIFYING": 1 } }
-}
-```
-
-**关键新增字段 `state`（分诊状态，给 Hermes 的决策信号）**:
-- `RUNNING` — IMPLEMENTING/REVIEWING（opencode/reviewer 在跑, 等它）
-- `WAITING_HUMAN` — VERIFYING 全绿（等 accept）或 ACCEPTED（等 merge）
-- `BLOCKED` — FAILED（需修复）或 CANCELLED
-- `DONE` — MERGED
-- `STALE` — 任意非终态且卡住检测触发（staleInfo 非空）
-
-`state` 派生规则（纯函数, 不依赖额外 IO）:
-- MERGED → DONE
-- FAILED/CANCELLED → BLOCKED
-- VERIFYING: verify 全过 → WAITING_HUMAN（提示 accept）; verify 有失败 → BLOCKED
-- ACCEPTED → WAITING_HUMAN（提示 merge）
-- IMPLEMENTING/REVIEWING/PLANNING → RUNNING
-- CREATED → WAITING_HUMAN（提示 start）
-- 任何非终态且 stale → STALE（覆盖上述）
-
-### 2. `htask advance [--id <id>] [--no-push]`
-
-自动推进**可自动的迁移**, 一次命令走完能走的路:
-
-- VERIFYING 且验证全过 → ACCEPTED（= 自动 accept）→ 继续尝试 MERGED（= 自动 merge, 含 git add/commit/push; --no-push 跳过 push）
-- VERIFYING 且有验证失败 → 拒绝（保持, 提示 FAILED 需修复）退出码 1
-- ACCEPTED → MERGED（= 自动 merge）
-- 其他状态（RUNNING/BLOCKED/DONE/CREATED）→ 不动, 打印当前 state 和原因, 退出码 0（幂等, 不报错）
-- 每次迁移打印 `✅ <id>: VERIFYING → ACCEPTED` 等一行
-- 最终打印: `✅ <id> → MERGED, 全链路自动完成` 或 `⏸ <id> 停在 <状态>: <原因>`（如 "等待 opencode 完成"）
-
-**幂等性**: 对已 MERGED 任务重复 advance → 无操作, 退出码 0, 不重复 commit。
-
-### 3. 安全性
-
-- `advance` 只在验证全过时自动 accept（与人工 accept 同一校验: verify 全过）
-- merge 的 git commit 失败不改状态（沿用现有行为）, advance 打印错误并停在 ACCEPTED
-- `--no-push` 供 CI/Hermes 预演
-- 无状态时（无当前任务）报错退出码 1
+- 新增内置保护清单: `['REPORT.md', 'REVIEW.md']`（相对项目根）
+- merge/advance 流程: `git add -A` → `git reset -- <保护清单>`（仅当文件存在时）→ commit
+- 报告文件仍保留在工作区（可读），只是不进 commit
+- 行为与 .gitignore 配置无关（双保险，即使项目配了 ignore 也不冲突）
 
 ## Design
 
-**`bin/htask.mjs` 增加**:
+**`bin/htask.mjs`**:
 
 ```js
-// state 派生
-export function deriveState(task) {
-  // 按 Expected Behavior 的规则表返回 'RUNNING'|'WAITING_HUMAN'|'BLOCKED'|'DONE'|'STALE'
-}
+// 内置保护: merge/advance 提交时排除的运行产物
+const MERGE_EXCLUDE = ['REPORT.md', 'REVIEW.md']
 
-// JSON 序列化（供 --json）
-function taskToJson(task) {
-  return {
-    id: task.id, title: task.title, status: task.status,
-    state: deriveState(task), taskFile: task.taskFile,
-    model: task.model, agent: task.agent ?? null, review: task.review ?? null,
-    verification: task.verification ?? {},   // 由 task.verify 派生 {cmd: bool}
-    verify: (task.verify ?? []).map(r => ({ command: r.command, exitCode: r.exitCode })),
-    historyCount: (task.history ?? []).length,
-    startedAt: task.startedAt, updatedAt: task.updatedAt, endedAt: task.endedAt ?? null,
-    stale: staleInfo(task),          // null 或 {reason}
-    nextStep: nextStep(task),
+// 在 git add 后、commit 前插入:
+function unstageExcluded(cwd) {
+  for (const f of MERGE_EXCLUDE) {
+    const r = spawnSync('git', ['reset', '--', f], { cwd, encoding: 'utf8' })
+    // git reset 不存在的文件也会 exit 0 (no-op), 无需检查存在性
+    if (r.status !== 0) getLogger?.warn?.(`git reset ${f} 失败: ${r.stderr}`) // 或 console.warn
   }
 }
-
-// list --json 聚合
-function listToJson(tasks) { /* tasks[] + summary {total, byStatus} */ }
 ```
 
-**cmdStatus/cmdList 改造**: 接受 `json` 参数（来自 `--json` flag）→ console.log(JSON.stringify(..., null, 2))
-
-**cmdAdvance 新增**:
-```js
-export async function cmdAdvance({ cwd, id, noPush }) {
-  // 读任务 → 按状态分支:
-  //   VERIFYING(全过) → transition ACCEPTED → 继续 merge 逻辑(复用)
-  //   VERIFYING(有失败) → 拒绝 exit 1
-  //   ACCEPTED → merge 逻辑
-  //   RUNNING/BLOCKED/DONE/CREATED → 幂等跳过, 打印原因, exit 0
-}
-```
-- 建议把 merge 的 git 逻辑抽成 `async function doMerge(cwd, task, {noPush})` 供 cmdMerge 和 cmdAdvance 复用
-- `main()` 的 `--json` flag 解析: `htask status --json` / `htask list --json` / `htask advance --json`（advance 也支持 --json 输出最终状态）
-
-**CLI 帮助更新**: 三个命令都注明 `--json`。
+- `cmdMerge` 在 `git add -A` 成功后调用 `unstageExcluded(cwd)`，再 commit
+- `cmdAdvance` 复用 cmdMerge 的 merge 逻辑（已抽取的 `doMerge`），自动获得保护
+- console.warn 风格与现有代码一致（中文）
 
 ## Files
 
-- 修改: `bin/htask.mjs`（deriveState/taskToJson/listToJson + cmdStatus/cmdList --json + cmdAdvance + doMerge 抽取）
+- 修改: `bin/htask.mjs`（MERGE_EXCLUDE + unstageExcluded + doMerge 内调用）
 - 修改: `test/htask.test.mjs`（新增测试）
-- 修改: `README.md`（--json + advance 用法, 状态机图补充 state 派生说明）
 
 ## Constraints
 
 - 零 npm 依赖, 单文件 CLI
-- `--json` 输出必须 `JSON.parse` 可解析（唯一 stdout 内容; 日志/提示走 stderr 或省略）
-- `deriveState` 是纯函数（可单测, 不 IO）
-- advance 幂等: 重复执行不产生副作用（不重复 commit/push）
-- advance 自动 accept 的校验与人工 accept 完全一致（verify 全过）
-- 现有 35 测试不回归
+- 不改变 commit 成功/失败的状态机行为（保护文件 reset 失败只 warn, 不阻断）
+- 报告文件在工作区必须保留（不删除）
+- 现有 47 测试不回归
 
 ## Acceptance Criteria
 
-1. `node --check` + 全量测试绿（新增: deriveState 各状态映射、taskToJson 字段、list --json summary、advance 全链路（VERIFYING→ACCEPTED→MERGED）、advance 幂等（重复无副作用）、advance 在验证失败时拒绝、advance 在 RUNNING 时跳过）
-2. `htask list --json` 输出可 JSON.parse, 含 state/summary
-3. `htask status --json` 含 state/nextStep/stale
-4. 端到端（假 opencode）: start → 停在 VERIFYING → `htask advance --no-push` → MERGED, 且重复 advance 无副作用
-5. README 更新
+1. 测试全绿（新增: merge 时 REPORT.md 不进 commit 但保留在工作区、REVIEW.md 同理、无报告文件时 merge 正常）
+2. 端到端: 临时项目有 REPORT.md + 代码改动 → advance → commit 不含 REPORT.md, 工作区仍有该文件
+3. README 提一句内置保护
 
 ## Verification Commands
 
@@ -169,5 +74,5 @@ node --test "test/*.test.mjs"
 
 ## Rollback Plan
 
-- `git revert`（htask 独立仓库）
-- advance 是纯增量命令, 不影响现有 start/accept/merge 流程
+- `git revert` 该 commit（htask 独立仓库）
+- 保护清单是纯增量逻辑, 不影响无报告文件的项目

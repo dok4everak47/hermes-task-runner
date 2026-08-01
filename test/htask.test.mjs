@@ -95,6 +95,8 @@ async function initGitRepo(dir) {
   execSync('git init -q', { cwd: dir });
   execSync('git config user.email test@test.com', { cwd: dir });
   execSync('git config user.name test', { cwd: dir });
+  // 初始 commit: HEAD 必须存在, 否则 git rev-list --count HEAD 等命令失败
+  execSync('git commit -qm init --allow-empty', { cwd: dir });
 }
 
 // 走合法迁移链到指定非终态 (CREATED 起步)
@@ -653,6 +655,8 @@ test('cmdAccept 拒绝: 非 VERIFYING 或验证未全过, 状态不变', async (
 test('cmdMerge: ACCEPTED → git commit → MERGED (--no-push)', async (t) => {
   const dir = await makeTempDir(t);
   await initGitRepo(dir);
+  // 有代码改动时: 提交应包含标题且排除报告文件
+  await writeFile(path.join(dir, 'app.js'), 'console.log(1)\n');
   const task = await createTask(dir, { title: '合并任务' });
   await toAccepted(dir, task.id);
 
@@ -699,11 +703,53 @@ test('cmdMerge 拒绝: git commit 失败时状态不变', async (t) => {
   assert.equal((await readTask(dir, task.id)).status, 'ACCEPTED'); // 状态不变
 });
 
+test('cmdMerge: REPORT.md/REVIEW.md 不进 commit 但保留在工作区', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: '保护报告' });
+  await toAccepted(dir, task.id);
+
+  // 运行产物 + 真实代码改动
+  await writeFile(path.join(dir, 'REPORT.md'), '# REPORT — 运行产物\n');
+  await writeFile(path.join(dir, 'REVIEW.md'), '# REVIEW\n');
+  await writeFile(path.join(dir, 'app.js'), 'console.log("code")\n');
+
+  const res = await cmdMerge({ cwd: dir, noPush: true });
+  assert.equal(res.ok, true);
+
+  const files = execSync('git show --name-only --pretty=format: HEAD', { cwd: dir, encoding: 'utf8' });
+  assert.ok(files.includes('app.js')); // 代码改动进 commit
+  assert.ok(!files.includes('REPORT.md')); // 报告文件不进 commit
+  assert.ok(!files.includes('REVIEW.md'));
+
+  // 工作区仍保留报告文件
+  assert.ok(existsSync(path.join(dir, 'REPORT.md')));
+  assert.ok(existsSync(path.join(dir, 'REVIEW.md')));
+  assert.ok((await readFile(path.join(dir, 'REPORT.md'), 'utf8')).includes('# REPORT'));
+});
+
+test('cmdMerge: 无报告文件时 merge 正常, 不引入额外文件', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: '无报告' });
+  await toAccepted(dir, task.id);
+  await writeFile(path.join(dir, 'app.js'), 'console.log("code")\n');
+
+  const res = await cmdMerge({ cwd: dir, noPush: true });
+  assert.equal(res.ok, true);
+  const files = execSync('git show --name-only --pretty=format: HEAD', { cwd: dir, encoding: 'utf8' });
+  assert.ok(files.includes('app.js'));
+  assert.ok(!files.includes('REPORT.md'));
+  assert.ok(!files.includes('REVIEW.md'));
+});
+
 // ---------- advance ----------
 
 test('cmdAdvance 全链路: VERIFYING(全过) → ACCEPTED → MERGED', async (t) => {
   const dir = await makeTempDir(t);
   await initGitRepo(dir);
+  // 有代码改动时 advance 应提交且排除报告文件
+  await writeFile(path.join(dir, 'app.js'), 'console.log(1)\n');
   const task = await createTask(dir, { title: '推进任务' });
   await walkTo(dir, task.id, 'VERIFYING');
   let cur = await readTask(dir, task.id);
@@ -721,6 +767,28 @@ test('cmdAdvance 全链路: VERIFYING(全过) → ACCEPTED → MERGED', async (t
   assert.ok(hist.includes('ACCEPTED→MERGED:auto'));
   const log = execSync('git log --oneline', { cwd: dir, encoding: 'utf8' });
   assert.ok(log.includes('推进任务'));
+});
+
+test('cmdAdvance: 自动 merge 时 REPORT.md 不进 commit, 工作区仍保留', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: '自动保护' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  await writeTask(dir, cur);
+
+  await writeFile(path.join(dir, 'REPORT.md'), '# REPORT — 自动推进\n');
+  await writeFile(path.join(dir, 'app.js'), 'console.log("code")\n');
+
+  const res = await cmdAdvance({ cwd: dir, noPush: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.action, 'merged');
+
+  const files = execSync('git show --name-only --pretty=format: HEAD', { cwd: dir, encoding: 'utf8' });
+  assert.ok(files.includes('app.js'));
+  assert.ok(!files.includes('REPORT.md'));
+  assert.ok(existsSync(path.join(dir, 'REPORT.md')));
 });
 
 test('cmdAdvance 幂等: 对 MERGED 重复执行无副作用, 不重复 commit', async (t) => {

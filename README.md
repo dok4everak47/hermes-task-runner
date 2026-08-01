@@ -46,6 +46,9 @@ CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED �
 `--no-push` 跳过 push)。验证有失败 → 拒绝 (退出码 1, 状态不变); 其他状态 (RUNNING/BLOCKED/CREATED)
 幂等跳过 (退出码 0); 已 MERGED 重复执行无副作用。自动 accept 与人工 accept 校验完全一致 (verify 全过)。
 
+内置报告保护: `merge` / `advance` 提交时自动把 `REPORT.md` / `REVIEW.md` 从暂存区排除
+(`git add -A` 后 reset), 不依赖项目 `.gitignore` 配置; 报告文件保留在工作区, 只不进 commit。
+
 每个任务一个文件 `.htask/tasks/<id>.json`, 含 status / history (迁移历史) / verify 结果等;
 `.htask/state.json` 只是当前任务指针 `{ currentId }`。旧格式 state.json (含 status)
 首次读取时自动迁移到 `tasks/task-<日期>-legacy.json`。
