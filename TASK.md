@@ -1,184 +1,164 @@
-# TASK — htask 引入任务状态机（Task State Machine）
+# TASK — htask JSON 输出 + advance 自动推进（Hermes 编排集成）
 
 ## Goal
 
-给 htask 每个任务引入明确的**生命周期状态机**，让 htask 从"脚本集合"升级为 orchestrator：
-- 任务有明确状态（CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED）
-- Hermes/用户一眼知道：哪些卡住、哪些需要人工介入、哪些可自动继续
-- 状态持久化 + 迁移历史可审计
+让 Hermes（外部编排者）能**程序化读取** htask 任务状态并**自动推进**任务，实现"读状态 → 分诊 → 介入"的 orchestrator 闭环。
 
-Before: 任务靠文件和人脑推进，`state.json` 只有粗糙的 running/verifying/done。
-After: 每个任务有完整状态机 + 迁移历史 + 卡住检测 + 人工确认闸门。
+Before: htask 输出是给人看的文本，Hermes 无法可靠解析；自动推进只能靠人肉敲 accept/merge。
+After: `htask list --json` / `htask status --json` 输出机器可读状态；`htask advance` 自动推进可自动的迁移（验证全绿 → ACCEPTED → MERGED）；Hermes 可据此自动介入。
 
 ## Context
 
-- 项目: ~/Project/hermes-task-runner（htask, 零依赖 node CLI, 当前 16 测试全绿）
-- 现有状态: `.htask/state.json` 单文件, `status` 取值 running/implementing/verifying/done/failed（粗糙）
-- 现有命令: `htask start`（解析 TASK.md → spawn opencode → 通知 → 验证 → REPORT.md）、`htask status`、`htask report`
-- 相关代码: `bin/htask.mjs`（~440 行, 单文件 CLI）, 测试 `test/htask.test.mjs`
-- 用户流程: ① 读代码 → ② TASK.md → ③ htask start → ④ 独立验收（REVIEW.md）→ ⑤ commit+push → ⑥ 简历
+- 项目: ~/Project/hermes-task-runner（htask, 零依赖 node CLI, 当前 35 测试全绿）
+- 现有状态机: CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED，人工闸门在 VERIFYING→ACCEPTED（accept）与 ACCEPTED→MERGED（merge）
+- 现有命令: start/status/report/accept/merge/cancel/list
+- 状态文件: `.htask/tasks/<id>.json`（含 status/history/verify 等）, `.htask/state.json` 存 currentId 指针
+- 用户工作流第④⑤步: Hermes 独立验收 → commit+push（对应 accept → merge）
 
 ## Current Behavior
 
-- `start` 内联顺序执行: 解析→实现→通知→验证→REPORT, 状态一次性写到 done/failed, 无中间状态记录
-- 无迁移历史、无人工确认闸门、无多任务记录、无法检测卡住
-- `status` 只显示当前单任务状态, `report` 只重新生成 REPORT.md
+- `htask status` / `htask list` 只输出人类可读文本（中文表格），无 `--json`
+- 自动推进需人工: 先 accept 再 merge 两条命令
+- Hermes 介入需要解析文本（脆弱）或自己读 JSON 文件（可行但散落各处）
 
 ## Expected Behavior
 
-### 状态机
+### 1. `--json` 输出（status / list）
 
-```
-CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED
-   │         │           │             │            │           │
-   │         │           │             │            └─(fail)→ FAILED
-   │         │           │             └─(review 结果仅记录)→ VERIFYING
-   │         │           └─(exit≠0)→ FAILED
-   │         └─(解析失败)→ FAILED
-   └─(任意非终态可)→ CANCELLED
-```
-
-| 迁移 | 触发者 | 条件 |
-|---|---|---|
-| CREATED → PLANNING | auto | `htask start` 解析 TASK.md 成功 |
-| PLANNING → IMPLEMENTING | auto | spawn opencode 前 |
-| IMPLEMENTING → REVIEWING | auto | opencode exit 0 且 `--review` 开启 |
-| IMPLEMENTING → VERIFYING | auto | opencode exit 0 且无 `--review` |
-| REVIEWING → VERIFYING | auto | reviewer 完成（无论 review 结果, 结果记录到 state.review） |
-| VERIFYING → ACCEPTED | **human** | 验证全过 + `htask accept` |
-| ACCEPTED → MERGED | **human** | `htask merge`（自动 git add/commit/push） |
-| 任意 → FAILED | auto | 失败条件（见上） |
-| 任意非终态 → CANCELLED | human | `htask cancel` |
-
-**人工闸门设计**（这是 orchestrator 的关键）:
-- VERIFYING 是全绿状态, 但**不自动** ACCEPTED——等人工 `htask accept`（对应工作流第④步"我独立验收"）
-- ACCEPTED 不自动 MERGED——等人工 `htask merge`（对应第⑤步 commit+push）
-- 验证有失败 → FAILED, 需 `htask retry` 或人工介入
-
-### 数据结构 `.htask/tasks/<id>.json`（每任务一文件）
-
+`htask status --json`（无参=当前任务）:
 ```json
 {
   "id": "task-20260801-toolstats",
-  "title": "Cortex 新增 toolStats 工具",
+  "title": "...",
   "status": "VERIFYING",
-  "agent": "opencode",
-  "model": "deepseek/deepseek-v4-flash",
+  "state": "WAITING_HUMAN",
   "taskFile": "TASK.md",
-  "review": "passed",
+  "model": "deepseek/deepseek-v4-flash",
+  "agent": null,
+  "review": null,
   "verification": { "typecheck": true, "test": true, "build": true },
-  "history": [
-    { "from": "CREATED", "to": "PLANNING", "at": "2026-08-01T12:00:00.000Z", "by": "auto" },
-    { "from": "PLANNING", "to": "IMPLEMENTING", "at": "2026-08-01T12:00:01.000Z", "by": "auto" },
-    { "from": "VERIFYING", "to": "ACCEPTED", "at": "2026-08-01T12:05:00.000Z", "by": "human" }
-  ],
-  "startedAt": "2026-08-01T12:00:00.000Z",
-  "updatedAt": "2026-08-01T12:05:00.000Z",
-  "endedAt": null,
-  "implementExit": 0,
-  "implementDurationMs": 120000,
-  "verify": [ { "command": "npm run typecheck", "exitCode": 0, "durationMs": 900, "output": "..." } ]
+  "verify": [{ "command": "npm run typecheck", "exitCode": 0 }],
+  "historyCount": 5,
+  "startedAt": "...", "updatedAt": "...", "endedAt": null,
+  "stale": null,
+  "nextStep": "等待人工: htask accept"
 }
 ```
 
-兼容: 旧的 `.htask/state.json` 保留为**当前任务指针**（存 `{ currentId: "task-xxx" }`），`htask status` 无参时读它；旧格式 state.json（含 status 字段）首次读取时自动迁移到 tasks/ 并删除。
-
-### 命令扩展
-
-```
-htask start [--model M] [--agent A] [--review] [--id <id>] [TASK.md]
-  # 自动: CREATED→PLANNING→IMPLEMENTING→(REVIEWING)→VERIFYING
-  # 结束时停在 VERIFYING (全绿) 或 FAILED; 打印 "下一步: htask accept"
-htask status [--id <id> | --all]
-  # 默认: 当前任务状态 + 迁移历史 + 下一步建议 ("等待人工: htask accept" / "可继续: htask merge")
-  # --all: 表格列出所有任务: id / 标题 / 状态 / 停留时长 / 卡住标记
-htask accept [--id <id>]
-  # VERIFYING→ACCEPTED (验证全过才允许; 有失败 → 拒绝并提示 FAILED)
-htask merge [--id <id>] [--no-push]
-  # ACCEPTED→MERGED: 自动 git add -A + git commit -m "<title>" --no-verify + git push (--no-push 跳过 push)
-htask cancel [--id <id>]
-  # 任意非终态→CANCELLED
-htask list
-  # = status --all 别名
+`htask list --json`:
+```json
+{
+  "tasks": [
+    { "id": "...", "title": "...", "status": "VERIFYING", "state": "WAITING_HUMAN", "updatedAt": "...", "stale": null, "nextStep": "..." }
+  ],
+  "summary": { "total": 1, "byStatus": { "VERIFYING": 1 } }
+}
 ```
 
-### 卡住检测（`status --all` / `list`）
+**关键新增字段 `state`（分诊状态，给 Hermes 的决策信号）**:
+- `RUNNING` — IMPLEMENTING/REVIEWING（opencode/reviewer 在跑, 等它）
+- `WAITING_HUMAN` — VERIFYING 全绿（等 accept）或 ACCEPTED（等 merge）
+- `BLOCKED` — FAILED（需修复）或 CANCELLED
+- `DONE` — MERGED
+- `STALE` — 任意非终态且卡住检测触发（staleInfo 非空）
 
-- 每个任务计算 `停留时长 = now - updatedAt`
-- 状态停留超过阈值标记 `⚠️ 卡住`:
-  - IMPLEMENTING > 30min（opencode 可能挂了）
-  - REVIEWING > 15min
-  - VERIFYING > 1h（等人工 accept 太久, 提醒）
-  - ACCEPTED > 24h（等 merge）
-- FAILED / MERGED / CANCELLED 是终态, 不标卡住
+`state` 派生规则（纯函数, 不依赖额外 IO）:
+- MERGED → DONE
+- FAILED/CANCELLED → BLOCKED
+- VERIFYING: verify 全过 → WAITING_HUMAN（提示 accept）; verify 有失败 → BLOCKED
+- ACCEPTED → WAITING_HUMAN（提示 merge）
+- IMPLEMENTING/REVIEWING/PLANNING → RUNNING
+- CREATED → WAITING_HUMAN（提示 start）
+- 任何非终态且 stale → STALE（覆盖上述）
+
+### 2. `htask advance [--id <id>] [--no-push]`
+
+自动推进**可自动的迁移**, 一次命令走完能走的路:
+
+- VERIFYING 且验证全过 → ACCEPTED（= 自动 accept）→ 继续尝试 MERGED（= 自动 merge, 含 git add/commit/push; --no-push 跳过 push）
+- VERIFYING 且有验证失败 → 拒绝（保持, 提示 FAILED 需修复）退出码 1
+- ACCEPTED → MERGED（= 自动 merge）
+- 其他状态（RUNNING/BLOCKED/DONE/CREATED）→ 不动, 打印当前 state 和原因, 退出码 0（幂等, 不报错）
+- 每次迁移打印 `✅ <id>: VERIFYING → ACCEPTED` 等一行
+- 最终打印: `✅ <id> → MERGED, 全链路自动完成` 或 `⏸ <id> 停在 <状态>: <原因>`（如 "等待 opencode 完成"）
+
+**幂等性**: 对已 MERGED 任务重复 advance → 无操作, 退出码 0, 不重复 commit。
+
+### 3. 安全性
+
+- `advance` 只在验证全过时自动 accept（与人工 accept 同一校验: verify 全过）
+- merge 的 git commit 失败不改状态（沿用现有行为）, advance 打印错误并停在 ACCEPTED
+- `--no-push` 供 CI/Hermes 预演
+- 无状态时（无当前任务）报错退出码 1
 
 ## Design
 
-**`bin/htask.mjs` 重构**（保持单文件, 用模块化函数组织）:
+**`bin/htask.mjs` 增加**:
 
 ```js
-// 状态机核心
-const STATES = ['CREATED','PLANNING','IMPLEMENTING','REVIEWING','VERIFYING','ACCEPTED','MERGED','FAILED','CANCELLED']
-const TERMINAL = new Set(['MERGED','FAILED','CANCELLED'])
-
-function newTaskId(title)      // task-YYYYMMDD-<slug>: 日期+标题前 12 字符(去非字母数字, 小写)
-async function createTask(cwd, meta)        // 写 tasks/<id>.json, 状态 CREATED, 更新 state.json 指针
-async function transition(cwd, id, to, by)  // 校验迁移合法(TRANSITIONS 表), 追加 history, 更新 status/updatedAt
-async function readTask(cwd, id) / readAllTasks(cwd)
-async function currentTask(cwd)             // 读 state.json 指针 → tasks/<id>.json
-function staleInfo(task)                    // 返回卡住标记 {stale, reason} 或 null
-function nextStep(task)                     // 根据状态返回建议: "等待人工: htask accept" 等
-
-const TRANSITIONS = {  // from -> Set<to>
-  'CREATED': ['PLANNING','CANCELLED'],
-  'PLANNING': ['IMPLEMENTING','FAILED','CANCELLED'],
-  'IMPLEMENTING': ['REVIEWING','VERIFYING','FAILED','CANCELLED'],
-  'REVIEWING': ['VERIFYING','FAILED','CANCELLED'],
-  'VERIFYING': ['ACCEPTED','FAILED','CANCELLED'],
-  'ACCEPTED': ['MERGED','CANCELLED'],
+// state 派生
+export function deriveState(task) {
+  // 按 Expected Behavior 的规则表返回 'RUNNING'|'WAITING_HUMAN'|'BLOCKED'|'DONE'|'STALE'
 }
+
+// JSON 序列化（供 --json）
+function taskToJson(task) {
+  return {
+    id: task.id, title: task.title, status: task.status,
+    state: deriveState(task), taskFile: task.taskFile,
+    model: task.model, agent: task.agent ?? null, review: task.review ?? null,
+    verification: task.verification ?? {},   // 由 task.verify 派生 {cmd: bool}
+    verify: (task.verify ?? []).map(r => ({ command: r.command, exitCode: r.exitCode })),
+    historyCount: (task.history ?? []).length,
+    startedAt: task.startedAt, updatedAt: task.updatedAt, endedAt: task.endedAt ?? null,
+    stale: staleInfo(task),          // null 或 {reason}
+    nextStep: nextStep(task),
+  }
+}
+
+// list --json 聚合
+function listToJson(tasks) { /* tasks[] + summary {total, byStatus} */ }
 ```
 
-**cmdStart 改造**:
-1. `createTask` → CREATED
-2. 解析 TASK.md → 成功 `transition PLANNING`，失败 → FAILED
-3. `transition IMPLEMENTING` → spawn opencode（日志到 `.htask/logs/<id>.log`）→ exit≠0 → FAILED
-4. `--review` → `transition REVIEWING` → spawn reviewer → 记录 review 结果 → `transition VERIFYING`；否则直接 `transition VERIFYING`
-5. 验证 → 全绿: 停在 VERIFYING, 打印 `✅ 验证全过, 下一步: htask accept`；有失败: `transition FAILED`, 打印失败项
-6. 生成 REPORT.md（含状态机信息: 当前状态 + 历史摘要）
+**cmdStatus/cmdList 改造**: 接受 `json` 参数（来自 `--json` flag）→ console.log(JSON.stringify(..., null, 2))
 
-**cmdAccept**: 读任务 → 必须 VERIFYING 且 verify 全过 → `transition ACCEPTED` → 提示 `下一步: htask merge`；否则拒绝（非 VERIFYING 或验证未全过）
+**cmdAdvance 新增**:
+```js
+export async function cmdAdvance({ cwd, id, noPush }) {
+  // 读任务 → 按状态分支:
+  //   VERIFYING(全过) → transition ACCEPTED → 继续 merge 逻辑(复用)
+  //   VERIFYING(有失败) → 拒绝 exit 1
+  //   ACCEPTED → merge 逻辑
+  //   RUNNING/BLOCKED/DONE/CREATED → 幂等跳过, 打印原因, exit 0
+}
+```
+- 建议把 merge 的 git 逻辑抽成 `async function doMerge(cwd, task, {noPush})` 供 cmdMerge 和 cmdAdvance 复用
+- `main()` 的 `--json` flag 解析: `htask status --json` / `htask list --json` / `htask advance --json`（advance 也支持 --json 输出最终状态）
 
-**cmdMerge**: 读任务 → 必须 ACCEPTED → 在项目根执行 `git add -A && git commit -m "<title>" --no-verify`（commit 失败不改变状态, 打印错误）→ `transition MERGED`（成功）→ 非 --no-push 时 `git push`（失败只告警不改变状态, 已 MERGED）
-
-**cmdCancel**: 非终态 → `transition CANCELLED`
-
-**cmdStatus / cmdList**: 见 Expected Behavior; 输出含状态机图示（简化为当前状态高亮）与下一步建议
-
-**向后兼容**: `state.json` 旧格式（含 status）首次读到时: 迁移到 tasks/<legacy-id>.json（id 用 task-<日期>-legacy）, 删旧文件, 写指针。`cmdReport` 用 currentTask。
+**CLI 帮助更新**: 三个命令都注明 `--json`。
 
 ## Files
 
-- 修改: `bin/htask.mjs`（状态机核心 + 命令扩展）
-- 修改: `test/htask.test.mjs`（新增状态机测试）
-- 修改: `README.md`（状态机说明 + 新命令用法）
+- 修改: `bin/htask.mjs`（deriveState/taskToJson/listToJson + cmdStatus/cmdList --json + cmdAdvance + doMerge 抽取）
+- 修改: `test/htask.test.mjs`（新增测试）
+- 修改: `README.md`（--json + advance 用法, 状态机图补充 state 派生说明）
 
 ## Constraints
 
-- 零 npm 依赖、单文件 CLI 不变
-- 状态机迁移必须**校验合法迁移**（非法迁移抛错, 不静默）
-- 人工闸门是硬约束: VERIFYING 不能自动变 ACCEPTED, ACCEPTED 不能自动变 MERGED（测试断言这一点）
-- 旧 state.json 兼容迁移不能丢数据（history 至少保留一条初始记录）
-- `htask accept/merge/cancel` 不带 --id 时操作当前任务, 无当前任务时报错退出码 1
-- 中文输出风格与现有代码一致
+- 零 npm 依赖, 单文件 CLI
+- `--json` 输出必须 `JSON.parse` 可解析（唯一 stdout 内容; 日志/提示走 stderr 或省略）
+- `deriveState` 是纯函数（可单测, 不 IO）
+- advance 幂等: 重复执行不产生副作用（不重复 commit/push）
+- advance 自动 accept 的校验与人工 accept 完全一致（verify 全过）
+- 现有 35 测试不回归
 
 ## Acceptance Criteria
 
-1. `node --check bin/htask.mjs` 通过
-2. 测试全绿（新增: 迁移合法性校验、非法迁移拒绝、人工闸门（verify 全绿但 status 仍 VERIFYING 直到 accept）、accept/merge/cancel 流程、旧 state.json 兼容迁移、卡住检测、nextStep 建议）
-3. 端到端（假 opencode）: start 结束停在 VERIFYING → accept → VERIFYING→ACCEPTED → merge → MERGED, 全程 history 正确
-4. `htask list` 显示多任务表格 + 卡住标记
-5. 验证失败路径: 假 opencode 或验证命令失败 → FAILED
+1. `node --check` + 全量测试绿（新增: deriveState 各状态映射、taskToJson 字段、list --json summary、advance 全链路（VERIFYING→ACCEPTED→MERGED）、advance 幂等（重复无副作用）、advance 在验证失败时拒绝、advance 在 RUNNING 时跳过）
+2. `htask list --json` 输出可 JSON.parse, 含 state/summary
+3. `htask status --json` 含 state/nextStep/stale
+4. 端到端（假 opencode）: start → 停在 VERIFYING → `htask advance --no-push` → MERGED, 且重复 advance 无副作用
+5. README 更新
 
 ## Verification Commands
 
@@ -189,5 +169,5 @@ node --test "test/*.test.mjs"
 
 ## Rollback Plan
 
-- `git revert` 该 commit（htask 独立仓库, 不影响其他项目）
-- 状态机数据在 .htask/tasks/ 下, 删除目录即回到无状态模式（代码仍兼容）
+- `git revert`（htask 独立仓库）
+- advance 是纯增量命令, 不影响现有 start/accept/merge 流程

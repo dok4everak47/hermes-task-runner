@@ -28,6 +28,24 @@ CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED �
 需人工 `htask accept` → `ACCEPTED`; 再人工 `htask merge` → `MERGED` (自动 git commit+push)。
 `FAILED / MERGED / CANCELLED` 是终态。
 
+### 分诊状态 `state` (Hermes 决策信号, 由 status/verify/stale 派生)
+
+| state | 含义 |
+|---|---|
+| `RUNNING` | PLANNING / IMPLEMENTING / REVIEWING, 等 opencode/reviewer |
+| `WAITING_HUMAN` | CREATED (等 start)、VERIFYING 全绿 (等 accept)、ACCEPTED (等 merge) |
+| `BLOCKED` | FAILED / CANCELLED、或 VERIFYING 验证有失败 |
+| `DONE` | MERGED |
+| `STALE` | 任意非终态且卡住检测触发 (覆盖上述) |
+
+`state` 是纯函数 `deriveState(task)`, 出现在 `--json` 输出里, Hermes 可据此决定介入。
+
+### `htask advance` — 自动推进可自动的迁移
+
+验证全绿时一次命令走完能走的路: `VERIFYING → ACCEPTED → MERGED` (自动 git commit+push,
+`--no-push` 跳过 push)。验证有失败 → 拒绝 (退出码 1, 状态不变); 其他状态 (RUNNING/BLOCKED/CREATED)
+幂等跳过 (退出码 0); 已 MERGED 重复执行无副作用。自动 accept 与人工 accept 校验完全一致 (verify 全过)。
+
 每个任务一个文件 `.htask/tasks/<id>.json`, 含 status / history (迁移历史) / verify 结果等;
 `.htask/state.json` 只是当前任务指针 `{ currentId }`。旧格式 state.json (含 status)
 首次读取时自动迁移到 `tasks/task-<日期>-legacy.json`。
@@ -36,14 +54,21 @@ CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED �
 
 ```bash
 htask start [--model <provider/model>] [--agent <agent>] [--review] [--id <id>] [TASK.md]
-htask status [--id <id> | --all]
-htask list                          # = status --all 别名
+htask status [--id <id> | --all] [--json]
+htask list [--json]                 # = status --all 别名
 htask accept [--id <id>]
 htask merge [--id <id>] [--no-push]
+htask advance [--id <id>] [--no-push] [--json]
 htask cancel [--id <id>]
 htask report
 htask --help
 ```
+
+`--json` 输出可 `JSON.parse` (唯一 stdout; 进度/日志走 stderr), 供 Hermes 程序化读取:
+
+- `htask status --json`: 单个任务对象, 含 `state` / `nextStep` / `stale` / `verify` / `historyCount`。
+- `htask list --json`: `{ tasks: [...], summary: { total, byStatus } }`。
+- `htask advance --json`: 输出最终状态 `{ id, status, state, action, message }`。
 
 `htask start` 流程 (状态流转):
 
@@ -58,7 +83,8 @@ htask --help
 `htask status` 显示当前任务状态 + 迁移历史 + 下一步建议 (如 `等待人工: htask accept`)。
 `htask list` 表格列出所有任务 (id / 标题 / 状态 / 停留时长 / 卡住标记)。
 卡住检测: IMPLEMENTING > 30min、REVIEWING > 15min、VERIFYING > 1h、ACCEPTED > 24h → `⚠️ 卡住`。
-`htask accept/merge/cancel` 不带 `--id` 时操作当前任务。
+`htask accept/merge/advance/cancel` 不带 `--id` 时操作当前任务。
+`htask advance` 供 CI/Hermes 自动推进: 验证全绿 → accept → merge 一步走完, 幂等可重跑。
 
 `.htask/state.lock` 防止并发 start (存在即拒绝)。
 

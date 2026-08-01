@@ -98,6 +98,45 @@ export function staleInfo(task) {
   return null;
 }
 
+// 分诊状态 (给 Hermes 的决策信号): RUNNING / WAITING_HUMAN / BLOCKED / DONE / STALE
+// 纯函数, 不依赖额外 IO。STALE 覆盖任意非终态 (终态不标 stale)。
+export function deriveState(task) {
+  const status = task?.status;
+  if (status === 'MERGED') return 'DONE';
+  if (status === 'FAILED' || status === 'CANCELLED') return 'BLOCKED';
+  if (status === 'VERIFYING') {
+    if (staleInfo(task)) return 'STALE';
+    const verify = task.verify ?? [];
+    return verify.every((r) => r.exitCode === 0) ? 'WAITING_HUMAN' : 'BLOCKED';
+  }
+  if (status === 'ACCEPTED') return staleInfo(task) ? 'STALE' : 'WAITING_HUMAN';
+  if (status === 'CREATED') return staleInfo(task) ? 'STALE' : 'WAITING_HUMAN';
+  if (status === 'PLANNING' || status === 'IMPLEMENTING' || status === 'REVIEWING') {
+    return staleInfo(task) ? 'STALE' : 'RUNNING';
+  }
+  return 'BLOCKED';
+}
+
+// advance 跳过时的原因 (人类可读)
+function skipReason(task) {
+  switch (task?.status) {
+    case 'CREATED':
+      return '未开始, 请先 htask start';
+    case 'PLANNING':
+      return '规划中';
+    case 'IMPLEMENTING':
+      return '等待 opencode 完成';
+    case 'REVIEWING':
+      return '等待 reviewer 完成';
+    case 'FAILED':
+      return '任务失败, 需修复后重试';
+    case 'CANCELLED':
+      return '任务已取消';
+    default:
+      return deriveState(task) === 'STALE' ? `已卡住: ${staleInfo(task)?.reason}` : '状态不可自动推进';
+  }
+}
+
 // ---------- 工具函数 ----------
 
 function fmtDuration(ms) {
@@ -676,15 +715,11 @@ export async function cmdAccept({ cwd, id }) {
 
 // ---------- 命令: merge ----------
 
-export async function cmdMerge({ cwd, id, noPush }) {
-  const task = await resolveTask(cwd, id);
-  if (!task) return { ok: false, reason: 'no-task' };
-  if (task.status !== 'ACCEPTED') {
-    console.error(`❌ 拒绝: 任务状态是 ${task.status}, 只有 ACCEPTED 可 merge`);
-    process.exitCode = 1;
-    return { ok: false, reason: 'wrong-state' };
-  }
-
+// git add/commit/push + transition MERGED, 供 cmdMerge / cmdAdvance 复用。
+// json 模式下进度消息走 stderr, 保持 stdout 只有 JSON。
+export async function doMerge(cwd, task, { noPush = false, by = 'human', json = false } = {}) {
+  const out = json ? console.error : console.log;
+  const warn = console.warn;
   const add = spawnSync('git', ['add', '-A'], { cwd, encoding: 'utf8' });
   if (add.status !== 0) {
     console.error(`❌ git add 失败 (状态不变):\n${add.stderr ?? add.stdout ?? ''}`);
@@ -700,21 +735,107 @@ export async function cmdMerge({ cwd, id, noPush }) {
     process.exitCode = 1;
     return { ok: false, reason: 'commit-failed' };
   }
-  console.log(`✅ git commit: ${task.title}`);
+  out(`✅ git commit: ${task.title}`);
 
-  await transition(cwd, task.id, 'MERGED', 'human');
+  await transition(cwd, task.id, 'MERGED', by);
 
   if (noPush) {
-    console.log('跳过 git push (--no-push)');
+    out('跳过 git push (--no-push)');
   } else {
     const push = spawnSync('git', ['push'], { cwd, encoding: 'utf8' });
     if (push.status !== 0) {
-      console.warn(`⚠️ git push 失败 (任务已 MERGED):\n${push.stderr ?? push.stdout ?? ''}`);
+      warn(`⚠️ git push 失败 (任务已 MERGED):\n${push.stderr ?? push.stdout ?? ''}`);
     } else {
-      console.log('✅ git push 成功');
+      out('✅ git push 成功');
     }
   }
   return { ok: true };
+}
+
+export async function cmdMerge({ cwd, id, noPush }) {
+  const task = await resolveTask(cwd, id);
+  if (!task) return { ok: false, reason: 'no-task' };
+  if (task.status !== 'ACCEPTED') {
+    console.error(`❌ 拒绝: 任务状态是 ${task.status}, 只有 ACCEPTED 可 merge`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'wrong-state' };
+  }
+  return doMerge(cwd, task, { noPush, by: 'human' });
+}
+
+// ---------- 命令: advance ----------
+
+// 自动推进可自动的迁移: VERIFYING(全过) → ACCEPTED → MERGED; ACCEPTED → MERGED。
+// 其余状态幂等跳过 (退出码 0); 验证失败拒绝 (退出码 1); 无任务报错 (退出码 1)。
+export async function cmdAdvance({ cwd, id, noPush, json = false }) {
+  const task = await resolveTask(cwd, id);
+  if (!task) {
+    if (json) {
+      console.log(
+        JSON.stringify(
+          { id: id ?? null, status: null, state: 'NOT_FOUND', action: 'none', message: '没有当前任务或任务不存在' },
+          null,
+          2
+        )
+      );
+    }
+    return { ok: false, reason: 'no-task' };
+  }
+  const out = json ? console.error : console.log;
+
+  // 幂等: 已 MERGED → 无操作
+  if (task.status === 'MERGED') {
+    const msg = `⏸ ${task.id} 已是终态 (MERGED), 无操作`;
+    if (json) console.log(JSON.stringify({ id: task.id, status: 'MERGED', state: 'DONE', action: 'none', message: msg }, null, 2));
+    else out(msg);
+    return { ok: true, action: 'none' };
+  }
+
+  if (task.status === 'VERIFYING') {
+    const verify = task.verify ?? [];
+    if (!verify.every((r) => r.exitCode === 0)) {
+      console.error(`❌ ${task.id} 验证未全过, 需修复 (保持 ${task.status})`);
+      process.exitCode = 1;
+      if (json) {
+        console.log(
+          JSON.stringify(
+            { id: task.id, status: 'VERIFYING', state: 'BLOCKED', action: 'none', message: '验证未全过, 需修复' },
+            null,
+            2
+          )
+        );
+      }
+      return { ok: false, reason: 'verify-failed' };
+    }
+    await transition(cwd, task.id, 'ACCEPTED', 'auto');
+    out(`✅ ${task.id}: VERIFYING → ACCEPTED`);
+    // 落到 ACCEPTED 分支继续
+  }
+
+  const cur = await readTask(cwd, task.id);
+  if (cur.status === 'ACCEPTED') {
+    const res = await doMerge(cwd, cur, { noPush, by: 'auto', json });
+    if (res.ok) {
+      const msg = `✅ ${cur.id} → MERGED, 全链路自动完成`;
+      if (json) console.log(JSON.stringify({ id: cur.id, status: 'MERGED', state: 'DONE', action: 'merged', message: msg }, null, 2));
+      else out(msg);
+      return { ok: true, action: 'merged' };
+    }
+    const msg = `⏸ ${cur.id} 停在 ACCEPTED: ${res.reason === 'commit-failed' ? 'git commit 失败, 请检查' : res.reason}`;
+    if (json) {
+      console.log(JSON.stringify({ id: cur.id, status: 'ACCEPTED', state: 'WAITING_HUMAN', action: 'accepted', message: msg }, null, 2));
+    } else {
+      out(msg);
+    }
+    return { ok: false, reason: res.reason };
+  }
+
+  // 其他状态: 幂等跳过, 打印 state + 原因, 退出码 0
+  const state = deriveState(cur);
+  const msg = `⏸ ${cur.id} 停在 ${cur.status}: ${skipReason(cur)}`;
+  if (json) console.log(JSON.stringify({ id: cur.id, status: cur.status, state, action: 'none', message: msg }, null, 2));
+  else out(msg);
+  return { ok: true, action: 'none' };
 }
 
 // ---------- 命令: cancel ----------
@@ -733,6 +854,52 @@ export async function cmdCancel({ cwd, id }) {
 }
 
 // ---------- 命令: status / list ----------
+
+// 单任务 JSON 序列化 (供 status --json)
+export function taskToJson(task) {
+  const stale = staleInfo(task);
+  return {
+    id: task.id,
+    title: task.title,
+    status: task.status,
+    state: deriveState(task),
+    taskFile: task.taskFile,
+    model: task.model,
+    agent: task.agent ?? null,
+    review: task.review ?? null,
+    verification: task.verification ?? verificationSummary(task.verify ?? []),
+    verify: (task.verify ?? []).map((r) => ({ command: r.command, exitCode: r.exitCode })),
+    historyCount: (task.history ?? []).length,
+    startedAt: task.startedAt,
+    updatedAt: task.updatedAt,
+    endedAt: task.endedAt ?? null,
+    stale: stale ? { reason: stale.reason } : null,
+    nextStep: nextStep(task),
+  };
+}
+
+// 列表 JSON 聚合 (供 list --json): tasks[] + summary { total, byStatus }
+export function listToJson(tasks) {
+  const byStatus = {};
+  for (const t of tasks) {
+    byStatus[t.status] = (byStatus[t.status] ?? 0) + 1;
+  }
+  return {
+    tasks: tasks.map((t) => {
+      const stale = staleInfo(t);
+      return {
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        state: deriveState(t),
+        updatedAt: t.updatedAt,
+        stale: stale ? { reason: stale.reason } : null,
+        nextStep: nextStep(t),
+      };
+    }),
+    summary: { total: tasks.length, byStatus },
+  };
+}
 
 function printTaskDetail(task) {
   const stale = staleInfo(task);
@@ -761,26 +928,34 @@ function printTaskDetail(task) {
   });
 }
 
-export async function cmdStatus({ cwd, id, all }) {
+export async function cmdStatus({ cwd, id, all, json }) {
   if (all) {
-    await cmdList({ cwd });
+    await cmdList({ cwd, json });
     return;
   }
   const task = id ? await readTask(cwd, id) : await currentTask(cwd);
   if (!task) {
     if (id) {
-      console.error(`❌ 任务不存在: ${id}`);
+      if (json) console.log(JSON.stringify({ id, status: null, state: 'NOT_FOUND', message: `任务不存在: ${id}` }, null, 2));
+      else console.error(`❌ 任务不存在: ${id}`);
       process.exitCode = 1;
+    } else if (json) {
+      console.log(JSON.stringify({ status: 'idle', state: 'IDLE', message: '没有当前任务, 先运行 htask start' }, null, 2));
     } else {
       console.log('状态: idle');
     }
     return;
   }
-  printTaskDetail(task);
+  if (json) console.log(JSON.stringify(taskToJson(task), null, 2));
+  else printTaskDetail(task);
 }
 
-export async function cmdList({ cwd }) {
+export async function cmdList({ cwd, json }) {
   const tasks = await readAllTasks(cwd);
+  if (json) {
+    console.log(JSON.stringify(listToJson(tasks), null, 2));
+    return;
+  }
   if (tasks.length === 0) {
     console.log('(无任务记录)');
     return;
@@ -832,10 +1007,11 @@ function printHelp() {
 
 用法:
   htask start [--model <provider/model>] [--agent <agent>] [--review] [--id <id>] [TASK.md]
-  htask status [--id <id> | --all]
-  htask list
+  htask status [--id <id> | --all] [--json]
+  htask list [--json]
   htask accept [--id <id>]
   htask merge [--id <id>] [--no-push]
+  htask advance [--id <id>] [--no-push] [--json]
   htask cancel [--id <id>]
   htask report
   htask --help
@@ -846,7 +1022,9 @@ function printHelp() {
   --review                   验证通过后运行 reviewer agent 生成 REVIEW.md
   --id <id>                  指定任务 id (默认当前任务)
   --all                      列出所有任务
-  --no-push                  merge 时跳过 git push
+  --no-push                  merge/advance 时跳过 git push
+  --json                     status/list/advance 输出 JSON (可 JSON.parse)
+  advance                    自动推进可自动的迁移: VERIFYING(全过)→ACCEPTED→MERGED
 
 环境变量 (测试注入):
   HTASK_OPENCODE_CMD          opencode 命令 (默认 opencode)
@@ -869,6 +1047,7 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
     else if (a === '--id') opts.id = rest[++i];
     else if (a === '--all') opts.all = true;
     else if (a === '--no-push') opts.noPush = true;
+    else if (a === '--json') opts.json = true;
     else opts.taskFile = a;
   }
 
@@ -877,16 +1056,19 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
       await cmdStart({ cwd, taskFile: opts.taskFile || 'TASK.md', model: opts.model, agent: opts.agent, review: opts.review, id: opts.id });
       break;
     case 'status':
-      await cmdStatus({ cwd, id: opts.id, all: opts.all });
+      await cmdStatus({ cwd, id: opts.id, all: opts.all, json: opts.json });
       break;
     case 'list':
-      await cmdList({ cwd });
+      await cmdList({ cwd, json: opts.json });
       break;
     case 'accept':
       await cmdAccept({ cwd, id: opts.id });
       break;
     case 'merge':
       await cmdMerge({ cwd, id: opts.id, noPush: opts.noPush });
+      break;
+    case 'advance':
+      await cmdAdvance({ cwd, id: opts.id, noPush: opts.noPush, json: opts.json });
       break;
     case 'cancel':
       await cmdCancel({ cwd, id: opts.id });

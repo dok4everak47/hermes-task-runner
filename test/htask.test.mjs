@@ -17,8 +17,12 @@ import {
   cmdReport,
   cmdAccept,
   cmdMerge,
+  cmdAdvance,
   cmdCancel,
   cmdList,
+  deriveState,
+  taskToJson,
+  listToJson,
   readState,
   readTask,
   readAllTasks,
@@ -335,6 +339,87 @@ test('nextStep: 给出下一步建议', () => {
   assert.equal(nextStep({}), '-');
 });
 
+// ---------- deriveState (分诊状态) ----------
+
+test('deriveState: 各状态映射', () => {
+  const old = (min) => new Date(Date.now() - min * 60000).toISOString();
+  assert.equal(deriveState({ status: 'MERGED' }), 'DONE');
+  assert.equal(deriveState({ status: 'FAILED' }), 'BLOCKED');
+  assert.equal(deriveState({ status: 'CANCELLED' }), 'BLOCKED');
+  assert.equal(deriveState({ status: 'CREATED' }), 'WAITING_HUMAN');
+  assert.equal(deriveState({ status: 'PLANNING' }), 'RUNNING');
+  assert.equal(deriveState({ status: 'IMPLEMENTING' }), 'RUNNING');
+  assert.equal(deriveState({ status: 'REVIEWING' }), 'RUNNING');
+  assert.equal(deriveState({ status: 'ACCEPTED' }), 'WAITING_HUMAN');
+  // VERIFYING: 全过 → WAITING_HUMAN, 有失败 → BLOCKED
+  const pass = { status: 'VERIFYING', verify: [{ command: 't', exitCode: 0 }] };
+  assert.equal(deriveState(pass), 'WAITING_HUMAN');
+  const fail = { status: 'VERIFYING', verify: [{ command: 't', exitCode: 1 }] };
+  assert.equal(deriveState(fail), 'BLOCKED');
+  assert.equal(deriveState({ status: 'VERIFYING', verify: [] }), 'WAITING_HUMAN'); // 空 = 全过
+  // STALE 覆盖非终态
+  assert.equal(deriveState({ status: 'IMPLEMENTING', updatedAt: old(31) }), 'STALE');
+  assert.equal(deriveState({ status: 'VERIFYING', verify: pass.verify, updatedAt: old(61) }), 'STALE');
+  assert.equal(deriveState({ status: 'ACCEPTED', updatedAt: old(24 * 60 + 1) }), 'STALE');
+  // 终态不标 stale
+  assert.equal(deriveState({ status: 'MERGED', updatedAt: old(999) }), 'DONE');
+});
+
+// ---------- taskToJson / listToJson ----------
+
+test('taskToJson: 字段齐全, state/nextStep/stale 派生', () => {
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-x',
+    title: '示例',
+    status: 'VERIFYING',
+    taskFile: 'TASK.md',
+    model: 'm',
+    agent: null,
+    review: null,
+    verification: null,
+    verify: [
+      { command: 'npm run typecheck', exitCode: 0, durationMs: 1, output: '' },
+      { command: 'npm test', exitCode: 0, durationMs: 1, output: '' },
+    ],
+    history: [{ from: null, to: 'VERIFYING', at: 'x', by: 'auto' }],
+    startedAt: now,
+    updatedAt: now,
+    endedAt: null,
+  };
+  const j = taskToJson(task);
+  assert.equal(j.id, 'task-x');
+  assert.equal(j.state, 'WAITING_HUMAN');
+  assert.deepEqual(j.verification, { typecheck: true, test: true });
+  assert.deepEqual(j.verify, [
+    { command: 'npm run typecheck', exitCode: 0 },
+    { command: 'npm test', exitCode: 0 },
+  ]);
+  assert.equal(j.historyCount, 1);
+  assert.equal(j.agent, null);
+  assert.equal(j.endedAt, null);
+  assert.equal(j.stale, null);
+  assert.equal(j.nextStep, '等待人工: htask accept');
+  // 可 JSON.parse
+  assert.deepEqual(JSON.parse(JSON.stringify(j)), j);
+});
+
+test('listToJson: tasks[] + summary {total, byStatus}', () => {
+  const tasks = [
+    { id: 'a', title: 'A', status: 'VERIFYING', verify: [{ exitCode: 0 }], updatedAt: 'x' },
+    { id: 'b', title: 'B', status: 'MERGED', updatedAt: 'y' },
+    { id: 'c', title: 'C', status: 'VERIFYING', verify: [{ exitCode: 1 }], updatedAt: 'z' },
+  ];
+  const j = listToJson(tasks);
+  assert.equal(j.summary.total, 3);
+  assert.deepEqual(j.summary.byStatus, { VERIFYING: 2, MERGED: 1 });
+  assert.deepEqual(j.tasks.map((t) => t.state), ['WAITING_HUMAN', 'DONE', 'BLOCKED']);
+  assert.equal(j.tasks[0].id, 'a');
+  assert.equal(j.tasks[0].nextStep, '等待人工: htask accept');
+  assert.equal(j.tasks[0].stale, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(j)), j);
+});
+
 // ---------- 旧 state.json 兼容迁移 ----------
 
 test('旧 state.json 兼容迁移: 首次读取迁移到 tasks/ 并写指针, 幂等', async (t) => {
@@ -612,6 +697,214 @@ test('cmdMerge 拒绝: git commit 失败时状态不变', async (t) => {
     process.exitCode = oldExit;
   }
   assert.equal((await readTask(dir, task.id)).status, 'ACCEPTED'); // 状态不变
+});
+
+// ---------- advance ----------
+
+test('cmdAdvance 全链路: VERIFYING(全过) → ACCEPTED → MERGED', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: '推进任务' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  await writeTask(dir, cur);
+
+  const res = await cmdAdvance({ cwd: dir, noPush: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.action, 'merged');
+  const merged = await readTask(dir, task.id);
+  assert.equal(merged.status, 'MERGED');
+  assert.ok(merged.endedAt);
+  const hist = merged.history.map((h) => `${h.from}→${h.to}:${h.by}`);
+  assert.ok(hist.includes('VERIFYING→ACCEPTED:auto'));
+  assert.ok(hist.includes('ACCEPTED→MERGED:auto'));
+  const log = execSync('git log --oneline', { cwd: dir, encoding: 'utf8' });
+  assert.ok(log.includes('推进任务'));
+});
+
+test('cmdAdvance 幂等: 对 MERGED 重复执行无副作用, 不重复 commit', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: '幂等任务' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  await writeTask(dir, cur);
+
+  await cmdAdvance({ cwd: dir, noPush: true });
+  const commitsBefore = execSync('git rev-list --count HEAD', { cwd: dir, encoding: 'utf8' }).trim();
+  const historyBefore = (await readTask(dir, task.id)).history.length;
+
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  try {
+    const res = await cmdAdvance({ cwd: dir, noPush: true });
+    assert.equal(res.ok, true);
+    assert.equal(res.action, 'none');
+    assert.equal(process.exitCode, 0);
+  } finally {
+    process.exitCode = oldExit;
+  }
+  const commitsAfter = execSync('git rev-list --count HEAD', { cwd: dir, encoding: 'utf8' }).trim();
+  const historyAfter = (await readTask(dir, task.id)).history.length;
+  assert.equal(commitsAfter, commitsBefore); // 不重复 commit
+  assert.equal(historyAfter, historyBefore); // 不重复迁移
+});
+
+test('cmdAdvance 拒绝: VERIFYING 验证有失败 → 保持, 退出码 1', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: '失败' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'ls', exitCode: 1, durationMs: 1, output: '' }];
+  await writeTask(dir, cur);
+
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  try {
+    const res = await cmdAdvance({ cwd: dir, noPush: true });
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'verify-failed');
+    assert.equal(process.exitCode, 1);
+  } finally {
+    process.exitCode = oldExit;
+  }
+  assert.equal((await readTask(dir, task.id)).status, 'VERIFYING'); // 状态不变
+});
+
+test('cmdAdvance 跳过: RUNNING/已取消/未开始 幂等跳过, 退出码 0', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: 'x' }); // CREATED
+  await transition(dir, task.id, 'PLANNING', 'auto');
+  await transition(dir, task.id, 'IMPLEMENTING', 'auto');
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  try {
+    const res = await cmdAdvance({ cwd: dir, noPush: true });
+    assert.equal(res.ok, true);
+    assert.equal(res.action, 'none');
+    assert.equal(process.exitCode, 0);
+  } finally {
+    process.exitCode = oldExit;
+  }
+  assert.equal((await readTask(dir, task.id)).status, 'IMPLEMENTING'); // 不动
+});
+
+test('cmdAdvance 无当前任务时报错退出码 1', async (t) => {
+  const dir = await makeTempDir(t);
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  try {
+    const res = await cmdAdvance({ cwd: dir, noPush: true });
+    assert.equal(res.ok, false);
+    assert.equal(process.exitCode, 1);
+  } finally {
+    process.exitCode = oldExit;
+  }
+});
+
+test('cmdAdvance --json 输出可 JSON.parse 且含最终状态', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: 'JSON推进' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  await writeTask(dir, cur);
+
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdAdvance({ cwd: dir, noPush: true, json: true });
+  } finally {
+    console.log = orig;
+  }
+  const last = logs[logs.length - 1];
+  const parsed = JSON.parse(last);
+  assert.equal(parsed.status, 'MERGED');
+  assert.equal(parsed.state, 'DONE');
+  assert.equal(parsed.action, 'merged');
+});
+
+// ---------- status/list --json ----------
+
+test('cmdStatus --json 含 state/nextStep/stale, 可 JSON.parse', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: '示例' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  await writeTask(dir, cur);
+
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdStatus({ cwd: dir, json: true });
+  } finally {
+    console.log = orig;
+  }
+  const parsed = JSON.parse(logs[0]);
+  assert.equal(parsed.id, task.id);
+  assert.equal(parsed.state, 'WAITING_HUMAN');
+  assert.equal(parsed.nextStep, '等待人工: htask accept');
+  assert.equal(parsed.stale, null);
+  assert.ok('historyCount' in parsed);
+});
+
+test('cmdStatus --json 无任务时 idle; 指定不存在 id 报错 JSON', async (t) => {
+  const dir = await makeTempDir(t);
+  const logs = [];
+  const orig = console.log;
+  const origErr = console.error;
+  console.log = (...a) => logs.push(a.join(' '));
+  console.error = () => {};
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  try {
+    await cmdStatus({ cwd: dir, json: true });
+    const idle = JSON.parse(logs[0]);
+    assert.equal(idle.state, 'IDLE');
+
+    logs.length = 0;
+    await cmdStatus({ cwd: dir, id: 'nope', json: true });
+    assert.equal(process.exitCode, 1);
+    const notFound = JSON.parse(logs[0]);
+    assert.equal(notFound.state, 'NOT_FOUND');
+  } finally {
+    console.log = orig;
+    console.error = origErr;
+    process.exitCode = oldExit;
+  }
+});
+
+test('cmdList --json: 输出 summary + state, 可 JSON.parse', async (t) => {
+  const dir = await makeTempDir(t);
+  const a = await createTask(dir, { title: '任务A' });
+  await walkTo(dir, a.id, 'VERIFYING');
+  let cur = await readTask(dir, a.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  await writeTask(dir, cur);
+  await createTask(dir, { title: '任务B' }); // CREATED
+
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdList({ cwd: dir, json: true });
+  } finally {
+    console.log = orig;
+  }
+  const parsed = JSON.parse(logs[0]);
+  assert.equal(parsed.tasks.length, 2);
+  assert.equal(parsed.summary.total, 2);
+  assert.deepEqual(parsed.summary.byStatus, { VERIFYING: 1, CREATED: 1 });
+  assert.ok(parsed.tasks.some((t2) => t2.state === 'WAITING_HUMAN'));
+  assert.ok(parsed.tasks.some((t2) => t2.state === 'WAITING_HUMAN' && t2.nextStep === '等待人工: htask accept'));
 });
 
 // ---------- cancel ----------
