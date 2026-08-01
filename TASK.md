@@ -1,138 +1,193 @@
-# TASK — Hermes Task Runner (htask)
+# TASK — htask 引入任务状态机（Task State Machine）
 
 ## Goal
 
-把「TASK.md → OpenCode 实现 → 完成通知 → 验证 → REPORT」整条链自动化成一条命令。
+给 htask 每个任务引入明确的**生命周期状态机**，让 htask 从"脚本集合"升级为 orchestrator：
+- 任务有明确状态（CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED）
+- Hermes/用户一眼知道：哪些卡住、哪些需要人工介入、哪些可自动继续
+- 状态持久化 + 迁移历史可审计
 
-Before: 人肉跑完流程（写 TASK.md、手动开 OpenCode、等、手动测试、手写报告）。
-After: `htask start TASK.md` 一条命令自动完成全链路，产出 TASK.md + REPORT.md（+ 可选 REVIEW.md）闭环。
+Before: 任务靠文件和人脑推进，`state.json` 只有粗糙的 running/verifying/done。
+After: 每个任务有完整状态机 + 迁移历史 + 卡住检测 + 人工确认闸门。
 
 ## Context
 
-- 背景: 用户工作流已固化 —— 写 TASK.md → OpenCode 后台实现（`opencode run --pure -m deepseek/deepseek-v4-flash`）→ 独立验收（typecheck/test/build）→ 报告。目前每步都靠人（或靠 Hermes agent 手动串联）。本工具把 ③④⑤ 自动化。
-- 灵感: TASK.md 模板已有固定字段（Goal / Design / Acceptance Criteria / Verification Commands 等），Verification Commands 是 ```bash 代码块 —— 机器可解析，这是自动化的前提。
-- 相关资产:
-  - 模板: `~/Project/.templates/TASK.md`（含 Verification Commands 格式）
-  - 通知模式: `~/Project/.templates/opencode-run.sh`（osascript 弹窗，已验证可用）
-  - Reviewer agent: `~/.config/opencode/agents/reviewer.md`（只读，输出 REVIEW.md）
-  - 环境: macOS, node v24.18.0 (`~/.nvm/versions/node/v24.18.0/bin`), opencode (`/opt/homebrew/bin/opencode`), osascript 可用
+- 项目: ~/Project/hermes-task-runner（htask, 零依赖 node CLI, 当前 16 测试全绿）
+- 现有状态: `.htask/state.json` 单文件, `status` 取值 running/implementing/verifying/done/failed（粗糙）
+- 现有命令: `htask start`（解析 TASK.md → spawn opencode → 通知 → 验证 → REPORT.md）、`htask status`、`htask report`
+- 相关代码: `bin/htask.mjs`（~440 行, 单文件 CLI）, 测试 `test/htask.test.mjs`
+- 用户流程: ① 读代码 → ② TASK.md → ③ htask start → ④ 独立验收（REVIEW.md）→ ⑤ commit+push → ⑥ 简历
 
 ## Current Behavior
 
-- 每一步手动: 写 TASK.md → 手动跑 `opencode-run "..."`（后台）→ 等通知 → 手动跑 typecheck/test/build → 手动汇总结果。
-- 没有状态追踪（任务跑到哪一步了）、没有自动验证、没有自动报告。
+- `start` 内联顺序执行: 解析→实现→通知→验证→REPORT, 状态一次性写到 done/failed, 无中间状态记录
+- 无迁移历史、无人工确认闸门、无多任务记录、无法检测卡住
+- `status` 只显示当前单任务状态, `report` 只重新生成 REPORT.md
 
 ## Expected Behavior
 
-`htask start TASK.md`（在项目根目录执行）:
+### 状态机
 
-1. **解析** TASK.md: 提取标题（第一行 `# TASK — xxx`）、`## Verification Commands` 下的 bash 代码块命令列表（忽略注释行/空行）。
-2. **启动实现**: spawn `opencode run --pure -m deepseek/deepseek-v4-flash "按 TASK.md 实现，完成后总结"`，cwd = 项目根，stdout/stderr 追加到 `.htask/implement.log`。后台运行。
-3. **完成通知**: OpenCode 进程退出后 osascript 弹窗（✅ 成功 / ❌ 失败 + 耗时）。
-4. **自动验证**: 逐条执行 TASK.md Verification Commands 里的命令（cwd = 项目根，超时 600s/条），记录 exit code、耗时、输出摘要（截断 2000 字符）。
-5. **生成 REPORT.md**: 项目根生成，含状态、验证结果表、输出摘要。
-6. （可选 `--review`）: 验证通过后自动跑 reviewer agent（`opencode run --pure --agent reviewer ...`）生成 REVIEW.md。
+```
+CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED
+   │         │           │             │            │           │
+   │         │           │             │            └─(fail)→ FAILED
+   │         │           │             └─(review fail)→ FAILED
+   │         │           └─(exit≠0)→ FAILED
+   │         └─(解析失败)→ FAILED
+   └─(任意非终态可)→ CANCELLED
+```
 
-`htask status`: 显示当前任务状态（.htask/state.json: idle/running/implementing/verifying/done/failed + 时间戳）。
+| 迁移 | 触发者 | 条件 |
+|---|---|---|
+| CREATED → PLANNING | auto | `htask start` 解析 TASK.md 成功 |
+| PLANNING → IMPLEMENTING | auto | spawn opencode 前 |
+| IMPLEMENTING → REVIEWING | auto | opencode exit 0 且 `--review` 开启 |
+| IMPLEMENTING → VERIFYING | auto | opencode exit 0 且无 `--review` |
+| REVIEWING → VERIFYING | auto | reviewer 完成（无论 review 结果, 结果记录到 state.review） |
+| VERIFYING → ACCEPTED | **human** | 验证全过 + `htask accept` |
+| ACCEPTED → MERGED | **human** | `htask merge`（自动 git add/commit/push） |
+| 任意 → FAILED | auto | 失败条件（见上） |
+| 任意非终态 → CANCELLED | human | `htask cancel` |
 
-`htask report`: 只根据已有 .htask 状态重新生成 REPORT.md（不重跑实现）。
+**人工闸门设计**（这是 orchestrator 的关键）:
+- VERIFYING 是全绿状态, 但**不自动** ACCEPTED——等人工 `htask accept`（对应工作流第④步"我独立验收"）
+- ACCEPTED 不自动 MERGED——等人工 `htask merge`（对应第⑤步 commit+push）
+- 验证有失败 → FAILED, 需 `htask retry` 或人工介入
+
+### 数据结构 `.htask/tasks/<id>.json`（每任务一文件）
+
+```json
+{
+  "id": "task-20260801-toolstats",
+  "title": "Cortex 新增 toolStats 工具",
+  "status": "VERIFYING",
+  "agent": "opencode",
+  "model": "deepseek/deepseek-v4-flash",
+  "taskFile": "TASK.md",
+  "review": "passed",
+  "verification": { "typecheck": true, "test": true, "build": true },
+  "history": [
+    { "from": "CREATED", "to": "PLANNING", "at": "2026-08-01T12:00:00.000Z", "by": "auto" },
+    { "from": "PLANNING", "to": "IMPLEMENTING", "at": "2026-08-01T12:00:01.000Z", "by": "auto" },
+    { "from": "VERIFYING", "to": "ACCEPTED", "at": "2026-08-01T12:05:00.000Z", "by": "human" }
+  ],
+  "startedAt": "2026-08-01T12:00:00.000Z",
+  "updatedAt": "2026-08-01T12:05:00.000Z",
+  "endedAt": null,
+  "implementExit": 0,
+  "implementDurationMs": 120000,
+  "verify": [ { "command": "npm run typecheck", "exitCode": 0, "durationMs": 900, "output": "..." } ]
+}
+```
+
+兼容: 旧的 `.htask/state.json` 保留为**当前任务指针**（存 `{ currentId: "task-xxx" }`），`htask status` 无参时读它；旧格式 state.json（含 status 字段）首次读取时自动迁移到 tasks/ 并删除。
+
+### 命令扩展
+
+```
+htask start [--model M] [--agent A] [--review] [--id <id>] [TASK.md]
+  # 自动: CREATED→PLANNING→IMPLEMENTING→(REVIEWING)→VERIFYING
+  # 结束时停在 VERIFYING (全绿) 或 FAILED; 打印 "下一步: htask accept"
+htask status [--id <id> | --all]
+  # 默认: 当前任务状态 + 迁移历史 + 下一步建议 ("等待人工: htask accept" / "可继续: htask merge")
+  # --all: 表格列出所有任务: id / 标题 / 状态 / 停留时长 / 卡住标记
+htask accept [--id <id>]
+  # VERIFYING→ACCEPTED (验证全过才允许; 有失败 → 拒绝并提示 FAILED)
+htask merge [--id <id>] [--no-push]
+  # ACCEPTED→MERGED: 自动 git add -A + git commit -m "<title>" --no-verify + git push (--no-push 跳过 push)
+htask cancel [--id <id>]
+  # 任意非终态→CANCELLED
+htask list
+  # = status --all 别名
+```
+
+### 卡住检测（`status --all` / `list`）
+
+- 每个任务计算 `停留时长 = now - updatedAt`
+- 状态停留超过阈值标记 `⚠️ 卡住`:
+  - IMPLEMENTING > 30min（opencode 可能挂了）
+  - REVIEWING > 15min
+  - VERIFYING > 1h（等人工 accept 太久, 提醒）
+  - ACCEPTED > 24h（等 merge）
+- FAILED / MERGED / CANCELLED 是终态, 不标卡住
 
 ## Design
 
-**位置**: `~/Project/hermes-task-runner/`（独立目录, 含 package.json + bin/htask.mjs + test/）
-**安装**: `npm link` 或手动软链 `/opt/homebrew/bin/htask -> .../bin/htask.mjs`
-**零 npm 依赖**: 只用 node 内置模块（node:test, node:child_process, node:fs/promises, node:path, node:os）。
-
-**bin/htask.mjs** 结构（单文件 CLI, shebang `#!/usr/bin/env node`）:
+**`bin/htask.mjs` 重构**（保持单文件, 用模块化函数组织）:
 
 ```js
-// 命令分发: start | status | report | --help
-// 关键函数:
-parseTaskFile(md)          // -> { title, verifyCommands: string[] }
-  // 正则提取 ```bash ... ``` 块在 "## Verification Commands" 之后
-  // 每行 trim, 跳过空行和 # 注释行
+// 状态机核心
+const STATES = ['CREATED','PLANNING','IMPLEMENTING','REVIEWING','VERIFYING','ACCEPTED','MERGED','FAILED','CANCELLED']
+const TERMINAL = new Set(['MERGED','FAILED','CANCELLED'])
 
-spawnOpenCode(cwd, extraArgs)  // spawn opencode run --pure -m <model> ...
-  // 日志追加到 .htask/implement.log
-  // 返回 Promise<{exitCode, durationMs}>  — 进程退出时 resolve
+function newTaskId(title)      // task-YYYYMMDD-<slug>: 日期+标题前 12 字符(去非字母数字, 小写)
+async function createTask(cwd, meta)        // 写 tasks/<id>.json, 状态 CREATED, 更新 state.json 指针
+async function transition(cwd, id, to, by)  // 校验迁移合法(TRANSITIONS 表), 追加 history, 更新 status/updatedAt
+async function readTask(cwd, id) / readAllTasks(cwd)
+async function currentTask(cwd)             // 读 state.json 指针 → tasks/<id>.json
+function staleInfo(task)                    // 返回卡住标记 {stale, reason} 或 null
+function nextStep(task)                     // 根据状态返回建议: "等待人工: htask accept" 等
 
-runVerifyCommands(cwd, cmds)   // 逐条执行, 超时 600s
-  // -> [{command, exitCode, durationMs, output(截断2000)}]
-  // 用 spawnSync 或 promisify(exec) with timeout; cwd=项目根
-
-writeReport(cwd, ctx)          // 生成 REPORT.md
-  // 格式见下
-
-notify(title, subtitle)        // osascript display notification (静默失败)
+const TRANSITIONS = {  // from -> Set<to>
+  'CREATED': ['PLANNING','CANCELLED'],
+  'PLANNING': ['IMPLEMENTING','FAILED','CANCELLED'],
+  'IMPLEMENTING': ['REVIEWING','VERIFYING','FAILED','CANCELLED'],
+  'REVIEWING': ['VERIFYING','FAILED','CANCELLED'],
+  'VERIFYING': ['ACCEPTED','FAILED','CANCELLED'],
+  'ACCEPTED': ['MERGED','CANCELLED'],
+}
 ```
 
-**REPORT.md 格式**:
+**cmdStart 改造**:
+1. `createTask` → CREATED
+2. 解析 TASK.md → 成功 `transition PLANNING`，失败 → FAILED
+3. `transition IMPLEMENTING` → spawn opencode（日志到 `.htask/logs/<id>.log`）→ exit≠0 → FAILED
+4. `--review` → `transition REVIEWING` → spawn reviewer → 记录 review 结果 → `transition VERIFYING`；否则直接 `transition VERIFYING`
+5. 验证 → 全绿: 停在 VERIFYING, 打印 `✅ 验证全过, 下一步: htask accept`；有失败: `transition FAILED`, 打印失败项
+6. 生成 REPORT.md（含状态机信息: 当前状态 + 历史摘要）
 
-```markdown
-# REPORT — <任务标题>
+**cmdAccept**: 读任务 → 必须 VERIFYING 且 verify 全过 → `transition ACCEPTED` → 提示 `下一步: htask merge`；否则拒绝（非 VERIFYING 或验证未全过）
 
-- 状态: ✅ 通过 / ❌ 失败
-- 开始: <ISO> · 结束: <ISO> · 耗时: <Xs>
-- 实现: OpenCode exit <code> (<duration>) · 日志: .htask/implement.log
+**cmdMerge**: 读任务 → 必须 ACCEPTED → 在项目根执行 `git add -A && git commit -m "<title>" --no-verify`（commit 失败不改变状态, 打印错误）→ `transition MERGED`（成功）→ 非 --no-push 时 `git push`（失败只告警不改变状态, 已 MERGED）
 
-## 验证结果
+**cmdCancel**: 非终态 → `transition CANCELLED`
 
-| # | 命令 | exit | 耗时 | 结果 |
-|---|------|------|------|------|
-| 1 | npm run typecheck | 0 | 8.2s | ✅ |
-| 2 | npm test | 0 | 45.1s | ✅ |
+**cmdStatus / cmdList**: 见 Expected Behavior; 输出含状态机图示（简化为当前状态高亮）与下一步建议
 
-## 输出摘要
-
-### 1. npm run typecheck
-```text
-<输出前 2000 字符>
-```
-```
-
-**状态文件** `.htask/state.json`:
-```json
-{ "status": "verifying", "startedAt": "...", "taskFile": "TASK.md",
-  "implementExit": 0, "implementDurationMs": 123, "verify": [...] }
-```
-- status 流转: running → implementing → verifying → done | failed
-- 用 `.htask/state.lock` 防止并发 start（存在即拒绝: "已有任务在运行"）
-
-**模型/agent 可覆盖**: `htask start --model <provider/model> --agent <name> TASK.md`，默认 `deepseek/deepseek-v4-flash` / 默认无 agent。
-
-**测试注入**: 环境变量 `HTASK_OPENCODE_CMD`（默认 `opencode`）和 `HTASK_OPENCODE_ARGS_PREFIX`（默认 `run --pure -m deepseek/deepseek-v4-flash`）——测试时用 `echo`/假脚本模拟 opencode，不真调 API 不花配额。
+**向后兼容**: `state.json` 旧格式（含 status）首次读到时: 迁移到 tasks/<legacy-id>.json（id 用 task-<日期>-legacy）, 删旧文件, 写指针。`cmdReport` 用 currentTask。
 
 ## Files
 
-- `~/Project/hermes-task-runner/package.json`（name: hermes-task-runner, bin: {htask: "./bin/htask.mjs"}, type: module）
-- `~/Project/hermes-task-runner/bin/htask.mjs`（CLI 全部逻辑）
-- `~/Project/hermes-task-runner/test/htask.test.mjs`（node:test 测试）
-- `~/Project/hermes-task-runner/README.md`（用法 + 与模板/工作流的关系）
+- 修改: `bin/htask.mjs`（状态机核心 + 命令扩展）
+- 修改: `test/htask.test.mjs`（新增状态机测试）
+- 修改: `README.md`（状态机说明 + 新命令用法）
 
 ## Constraints
 
-- 零 npm 依赖、零构建（node 24 直接跑 .mjs）
-- 不修改 dist/、不碰项目源码逻辑——htask 只读 TASK.md、只写 .htask/ 和 REPORT.md/REVIEW.md
-- 注释/输出用中文（与用户习惯一致），代码标识符用英文
-- osascript 通知失败必须静默（不阻塞主流程）
-- 命令解析要容错: 找不到 Verification Commands 时告警并用默认验证（typecheck+test+build 提示）, 不 crash
-- 用 `node:test`（node 内置, 无依赖）; 测试必须不真调 opencode
+- 零 npm 依赖、单文件 CLI 不变
+- 状态机迁移必须**校验合法迁移**（非法迁移抛错, 不静默）
+- 人工闸门是硬约束: VERIFYING 不能自动变 ACCEPTED, ACCEPTED 不能自动变 MERGED（测试断言这一点）
+- 旧 state.json 兼容迁移不能丢数据（history 至少保留一条初始记录）
+- `htask accept/merge/cancel` 不带 --id 时操作当前任务, 无当前任务时报错退出码 1
+- 中文输出风格与现有代码一致
 
 ## Acceptance Criteria
 
-1. `node --test test/` 全绿（测试覆盖: parseTaskFile 提取命令、忽略注释、verify 执行记录 exit code、REPORT.md 生成、状态流转、并发锁）
-2. 在临时测试项目端到端: `htask start` 用假 opencode（HTASK_OPENCODE_CMD=假脚本）跑通 → 生成 REPORT.md 且内容含验证结果表
-3. `htask status` 显示正确状态
-4. 有 Verification Commands 的 TASK.md 能正确提取并执行; 无命令时告警不 crash
-5. `node --check bin/htask.mjs` 语法通过
+1. `node --check bin/htask.mjs` 通过
+2. 测试全绿（新增: 迁移合法性校验、非法迁移拒绝、人工闸门（verify 全绿但 status 仍 VERIFYING 直到 accept）、accept/merge/cancel 流程、旧 state.json 兼容迁移、卡住检测、nextStep 建议）
+3. 端到端（假 opencode）: start 结束停在 VERIFYING → accept → VERIFYING→ACCEPTED → merge → MERGED, 全程 history 正确
+4. `htask list` 显示多任务表格 + 卡住标记
+5. 验证失败路径: 假 opencode 或验证命令失败 → FAILED
 
 ## Verification Commands
 
 ```bash
-cd ~/Project/hermes-task-runner && node --check bin/htask.mjs && node --test test/
+node --check bin/htask.mjs
+node --test "test/*.test.mjs"
 ```
 
 ## Rollback Plan
 
-- `rm -rf ~/Project/hermes-task-runner` + 移除 `/opt/homebrew/bin/htask` 软链
-- 不影响任何现有项目（独立目录）
+- `git revert` 该 commit（htask 独立仓库, 不影响其他项目）
+- 状态机数据在 .htask/tasks/ 下, 删除目录即回到无状态模式（代码仍兼容）

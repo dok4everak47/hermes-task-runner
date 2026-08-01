@@ -1,10 +1,7 @@
 # hermes-task-runner (htask)
 
-把「TASK.md → OpenCode 实现 → 完成通知 → 验证 → REPORT」整条链自动化成一条命令。
-
-```
-htask start TASK.md
-```
+把「TASK.md → OpenCode 实现 → 完成通知 → 验证 → REPORT」整条链自动化成一条命令,
+并给每个任务引入生命周期状态机, 升级为 orchestrator。
 
 ## 安装
 
@@ -15,26 +12,53 @@ ln -s "$(pwd)/bin/htask.mjs" /opt/homebrew/bin/htask
 
 依赖: macOS, node ≥ 24, opencode (`/opt/homebrew/bin/opencode`), osascript。
 
+## 状态机
+
+```
+CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED
+   │         │           │             │            │           │
+   │         │           │             │            └─(fail)→ FAILED
+   │         │           │             └─(review fail)→ FAILED
+   │         │           └─(exit≠0)→ FAILED
+   │         └─(解析失败)→ FAILED
+   └─(任意非终态可)→ CANCELLED
+```
+
+关键设计: **人工闸门**。验证全绿后任务停在 `VERIFYING` (不自动 accept),
+需人工 `htask accept` → `ACCEPTED`; 再人工 `htask merge` → `MERGED` (自动 git commit+push)。
+`FAILED / MERGED / CANCELLED` 是终态。
+
+每个任务一个文件 `.htask/tasks/<id>.json`, 含 status / history (迁移历史) / verify 结果等;
+`.htask/state.json` 只是当前任务指针 `{ currentId }`。旧格式 state.json (含 status)
+首次读取时自动迁移到 `tasks/task-<日期>-legacy.json`。
+
 ## 用法
 
 ```bash
-htask start [--model <provider/model>] [--agent <agent>] [--review] [TASK.md]
-htask status
+htask start [--model <provider/model>] [--agent <agent>] [--review] [--id <id>] [TASK.md]
+htask status [--id <id> | --all]
+htask list                          # = status --all 别名
+htask accept [--id <id>]
+htask merge [--id <id>] [--no-push]
+htask cancel [--id <id>]
 htask report
 htask --help
 ```
 
-`htask start` 流程:
+`htask start` 流程 (状态流转):
 
-1. 解析 TASK.md: 标题 + `## Verification Commands` 下的 bash 命令 (忽略注释/空行)。
-2. spawn `opencode run --pure -m deepseek/deepseek-v4-flash "按 TASK.md 实现，完成后总结"`, stdout/stderr 追加到 `.htask/implement.log`, 后台运行。
+1. 创建任务 → `CREATED`; 解析 TASK.md (标题 + `## Verification Commands` 下的 bash 命令) → 成功 `PLANNING`, 失败 `FAILED`。
+2. `IMPLEMENTING`: spawn `opencode run --pure -m deepseek/deepseek-v4-flash "按 TASK.md 实现，完成后总结"`, 日志到 `.htask/logs/<id>.log`, exit≠0 → `FAILED`。
 3. 退出后 osascript 弹窗通知 (✅/❌ + 耗时)。
-4. 逐条执行验证命令 (超时 600s/条), 记录 exit code / 耗时 / 输出摘要 (截断 2000 字符)。
-5. 生成 REPORT.md (状态 + 验证结果表 + 输出摘要)。
-6. `--review`: 验证通过后自动跑 reviewer agent (`--agent reviewer`) 生成 REVIEW.md。
+4. `--review`: `REVIEWING` → 跑 reviewer agent → 记录结果到 state.review → `VERIFYING`。
+5. 逐条执行验证命令 (超时 600s/条), 记录 exit code / 耗时 / 输出摘要 (截断 2000 字符)。
+6. 全绿 → 停在 `VERIFYING`, 打印 "下一步: htask accept"; 有失败 → `FAILED`。
+7. 生成 REPORT.md (状态机状态 + 迁移历史 + 验证结果表)。
 
-`htask status` 读取 `.htask/state.json` 显示当前状态 (`idle/running/implementing/verifying/done/failed`)。
-`htask report` 只根据已有 `.htask/state.json` 重新生成 REPORT.md, 不重跑实现。
+`htask status` 显示当前任务状态 + 迁移历史 + 下一步建议 (如 `等待人工: htask accept`)。
+`htask list` 表格列出所有任务 (id / 标题 / 状态 / 停留时长 / 卡住标记)。
+卡住检测: IMPLEMENTING > 30min、REVIEWING > 15min、VERIFYING > 1h、ACCEPTED > 24h → `⚠️ 卡住`。
+`htask accept/merge/cancel` 不带 `--id` 时操作当前任务。
 
 `.htask/state.lock` 防止并发 start (存在即拒绝)。
 
