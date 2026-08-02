@@ -49,6 +49,7 @@ import {
   AGENT_ADAPTERS,
   getAgentAdapter,
   resolveAgentBackend,
+  buildAgentArgs,
   runAgent,
   printDiagnosis,
   loadApprovalPolicy,
@@ -1522,9 +1523,16 @@ test('runAgent: 无 HTASK_OPENCODE_CMD 时按适配器组装参数执行', async
   );
   assert.equal(r.exitCode, 0);
   const fake = await readFile(path.join(dir, 'fake.log'), 'utf8');
+  assert.ok(fake.startsWith('run --pure'), `命令不应重复脚本路径, 实际: ${fake.trim()}`);
   assert.ok(fake.includes('-m gpt-4o'));
   assert.ok(fake.includes('--agent reviewer'));
   assert.ok(fake.includes('修复并重新实现'));
+});
+
+test('buildAgentArgs: 不重复 runCmd 命令本身, model/agent 正确追加', () => {
+  const adapter = { runCmd: ['opencode', 'run', '--pure'], modelFlag: '-m', agentFlag: '--agent' };
+  assert.deepEqual(buildAgentArgs(adapter, { model: 'm1', agent: 'a1' }), ['run', '--pure', '-m', 'm1', '--agent', 'a1']);
+  assert.deepEqual(buildAgentArgs(adapter, {}), ['run', '--pure']);
 });
 
 test('cmdStart --agent-backend: 未知后端报错且不创建任务; 默认 opencode 记录 agentBackend', async (t) => {

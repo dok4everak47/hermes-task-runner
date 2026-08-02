@@ -688,7 +688,8 @@ function reportAgentUnavailable(backend) {
 
 // 按适配器组装参数: runCmd + modelFlag/agentFlag + prompt
 export function buildAgentArgs(adapter, { model, agent } = {}) {
-  const args = [...adapter.runCmd];
+  // runCmd[0] 是命令本身 (spawnAgentCmd 单独传), args 从第二个元素开始
+  const args = [...adapter.runCmd.slice(1)];
   if (model) args.push(adapter.modelFlag, model);
   if (agent && adapter.agentFlag) args.push(adapter.agentFlag, agent);
   return args;
@@ -898,7 +899,7 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     const implement = await runAgent(
       cwd,
       backend.backend,
-      { model, agent },
+      { model: model ?? task.model, agent },
       `按 ${path.basename(taskFile)} 实现，完成后总结`,
       logName
     );
