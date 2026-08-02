@@ -53,6 +53,48 @@ CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED �
 `.htask/state.json` 只是当前任务指针 `{ currentId }`。旧格式 state.json (含 status)
 首次读取时自动迁移到 `tasks/task-<日期>-legacy.json`。
 
+## 可观测性
+
+实时状态写入 `.htask/progress.json` (单文件, 只写不读, 供菜单栏/手机端等外部工具消费):
+
+```
+{taskId, status, stage, progress, currentAction, startedAt, updatedAt}
+```
+
+stage / progress 映射:
+
+| status | stage | progress |
+|---|---|---|
+| CREATED | created | 5 |
+| PLANNING | planning | 15 |
+| IMPLEMENTING | coding | 40 |
+| REVIEWING | reviewing | 60 |
+| VERIFYING | testing | 80 |
+| ACCEPTED | merging | 90 |
+| MERGED | finished | 100 |
+| FAILED | failed | 0 |
+| CANCELLED | cancelled | 0 |
+| (无任务) | idle | 0 |
+
+验证命令逐条执行时, `currentAction` 实时更新为 `运行验证: <命令>`, 可观察"正在跑哪条"。
+
+事件 (`events.jsonl`, JSON Lines 追加):
+
+```
+task.created  task.started  task.review_failed  task.verifying
+task.waiting_human  task.completed  task.retrying
+test_started  test_passed  test_failed   # 验证粒度, detail 含命令
+```
+
+通知节点: 🔨 开始 / 🧪 测试中 / ✅ 完成 / ❌ 失败 (osascript 弹窗), 设 `HTASK_NOTIFY=0` 全关。
+
+消费示例:
+
+```bash
+cat .htask/progress.json
+tail .htask/events.jsonl
+```
+
 ## Task Planner (`htask plan`)
 
 `htask plan [TASK.md] [--json]` 用纯规则 (零依赖, 不用 LLM) 分析任务并输出建议:
