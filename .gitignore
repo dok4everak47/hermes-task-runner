@@ -5,3 +5,4 @@ node_modules/
 /REVIEW.md
 .DS_Store
 .supervisor/
+.worktrees/

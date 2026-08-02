@@ -55,6 +55,7 @@ import {
   loadApprovalPolicy,
   parseApprovalYaml,
   approvalDecision,
+  cmdWorktree,
 } from '../bin/htask.mjs';
 
 async function makeTempDir(t) {
@@ -1940,4 +1941,155 @@ test('main 分发: retry/agents/policy 命令可达', async (t) => {
     console.error = origErr;
     process.exitCode = oldExit;
   }
+});
+
+// ---------- worktree 并行任务隔离 ----------
+
+function captureOutput(fn) {
+  const logs = [];
+  const orig = console.log;
+  const origErr = console.error;
+  console.log = (...a) => logs.push(a.join(' '));
+  console.error = (...a) => logs.push(a.join(' '));
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  return async () => {
+    try {
+      const r = await fn();
+      return { logs, exitCode: process.exitCode, result: r };
+    } finally {
+      console.log = orig;
+      console.error = origErr;
+      process.exitCode = oldExit;
+    }
+  };
+}
+
+test('worktree create: 成功创建 + git worktree list 可见 task/<slug> 分支', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const run = captureOutput(() => cmdWorktree({ cwd: dir, args: ['create', 'demo'] }));
+  const { logs, exitCode, result } = await run();
+  assert.equal(exitCode, 0);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.branch, 'task/demo');
+  assert.ok(logs.some((l) => l.includes('✅ worktree 已创建')));
+
+  const list = execSync('git worktree list', { cwd: dir, encoding: 'utf8' });
+  assert.ok(list.includes('.worktrees/demo'));
+  assert.ok(list.includes('task/demo'));
+  assert.ok(existsSync(path.join(dir, '.worktrees', 'demo')));
+});
+
+test('worktree create: 重复 slug 明确报错, 不破坏现有状态', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  await cmdWorktree({ cwd: dir, args: ['create', 'dup'] });
+  const run = captureOutput(() => cmdWorktree({ cwd: dir, args: ['create', 'dup'] }));
+  const { logs, exitCode, result } = await run();
+  assert.equal(exitCode, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'exists');
+  assert.ok(logs.some((l) => l.includes('worktree 已存在')));
+  assert.ok(existsSync(path.join(dir, '.worktrees', 'dup')));
+});
+
+test('worktree create: 非法 slug 报错', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const run = captureOutput(() => cmdWorktree({ cwd: dir, args: ['create', 'Bad_Slug!'] }));
+  const { logs, exitCode, result } = await run();
+  assert.equal(exitCode, 1);
+  assert.equal(result.reason, 'invalid-slug');
+  assert.ok(logs.some((l) => l.includes('slug 非法')));
+});
+
+test('worktree list: 摘要列出 path/branch/status', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  await cmdWorktree({ cwd: dir, args: ['create', 'listme'] });
+  const run = captureOutput(() => cmdWorktree({ cwd: dir, args: ['list'] }));
+  const { logs, result } = await run();
+  assert.equal(result.ok, true);
+  assert.equal(result.result.total >= 2, true);
+  const wt = result.result.worktrees.find((w) => w.path.endsWith('listme'));
+  assert.ok(wt, '应列出 .worktrees/listme');
+  assert.equal(wt.branch, 'task/listme');
+  assert.equal(wt.status, 'clean');
+  assert.ok(logs.some((l) => l.includes('BRANCH')));
+
+  // --json 路径
+  const run2 = captureOutput(() => cmdWorktree({ cwd: dir, args: ['list', '--json'] }));
+  const j = await run2();
+  const parsed = JSON.parse(j.logs.find((l) => l.startsWith('{')));
+  assert.equal(parsed.type, 'worktree');
+  assert.equal(parsed.id, 'list');
+});
+
+test('worktree remove: 成功清理', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  await cmdWorktree({ cwd: dir, args: ['create', 'bye'] });
+  assert.ok(existsSync(path.join(dir, '.worktrees', 'bye')));
+  const run = captureOutput(() => cmdWorktree({ cwd: dir, args: ['remove', 'bye'] }));
+  const { logs, exitCode, result } = await run();
+  assert.equal(exitCode, 0);
+  assert.equal(result.ok, true);
+  assert.ok(logs.some((l) => l.includes('✅ worktree 已删除')));
+  assert.ok(!existsSync(path.join(dir, '.worktrees', 'bye')));
+
+  const list = execSync('git worktree list', { cwd: dir, encoding: 'utf8' });
+  assert.ok(!list.includes('.worktrees/bye'));
+});
+
+test('worktree remove: 脏 worktree 报错并提示 --force', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  await cmdWorktree({ cwd: dir, args: ['create', 'dirty'] });
+  await writeFile(path.join(dir, '.worktrees', 'dirty', 'wip.txt'), 'uncommitted\n');
+
+  const run = captureOutput(() => cmdWorktree({ cwd: dir, args: ['remove', 'dirty'] }));
+  const { logs, exitCode, result } = await run();
+  assert.equal(exitCode, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'dirty');
+  assert.equal(result.hint, '--force');
+  assert.ok(logs.some((l) => l.includes('--force')));
+
+  // --force 强制删除成功
+  const run2 = captureOutput(() => cmdWorktree({ cwd: dir, args: ['remove', 'dirty', '--force'] }));
+  const f = await run2();
+  assert.equal(f.exitCode, 0);
+  assert.ok(!existsSync(path.join(dir, '.worktrees', 'dirty')));
+});
+
+test('worktree remove: worktree 不存在报错', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const run = captureOutput(() => cmdWorktree({ cwd: dir, args: ['remove', 'nope'] }));
+  const { logs, exitCode, result } = await run();
+  assert.equal(exitCode, 1);
+  assert.equal(result.reason, 'not-found');
+  assert.ok(logs.some((l) => l.includes('worktree 不存在')));
+});
+
+test('worktree: 未知子命令报错', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const run = captureOutput(() => cmdWorktree({ cwd: dir, args: ['bogus'] }));
+  const { logs, exitCode, result } = await run();
+  assert.equal(exitCode, 1);
+  assert.equal(result.reason, 'unknown-subcommand');
+  assert.ok(logs.some((l) => l.includes('未知 worktree 子命令')));
+});
+
+test('main 分发: worktree 命令可达', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const run = captureOutput(() => main(['worktree', 'create', 'mwt'], { cwd: dir }));
+  const { logs, exitCode } = await run();
+  assert.equal(exitCode, 0);
+  assert.ok(logs.some((l) => l.includes('✅ worktree 已创建')));
+  const list = execSync('git worktree list', { cwd: dir, encoding: 'utf8' });
+  assert.ok(list.includes('task/mwt'));
 });

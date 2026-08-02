@@ -158,6 +158,8 @@ function escapeOsascript(s) {
 
 // 弹 macOS 通知, 失败必须静默 (不阻塞主流程)
 function notify(title, subtitle) {
+  // HTASK_NOTIFY=0 完全禁用弹窗 (cron/批处理/嫌吵时用)
+  if (process.env.HTASK_NOTIFY === '0') return;
   try {
     const script = `display notification "${escapeOsascript(subtitle)}" with title "${escapeOsascript(title)}"`;
     const child = spawn('osascript', ['-e', script], { stdio: 'ignore' });
@@ -909,10 +911,14 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     task.updatedAt = new Date().toISOString();
     await writeTask(cwd, task);
 
-    notify(
-      implement.exitCode === 0 ? '✅ Agent 完成' : '❌ Agent 失败',
-      `exit ${implement.exitCode} · 耗时 ${fmtDuration(implement.durationMs)}`
-    );
+    // 噪音过滤: 成功但极短耗时 (<10s) 说明 agent 没真正干活, 不弹;
+    // 失败始终弹 (需要人注意)
+    if (implement.exitCode !== 0 || implement.durationMs >= 10000) {
+      notify(
+        implement.exitCode === 0 ? '✅ Agent 完成' : '❌ Agent 失败',
+        `exit ${implement.exitCode} · 耗时 ${fmtDuration(implement.durationMs)}`
+      );
+    }
 
     if (implement.exitCode !== 0) {
       await transition(cwd, task.id, 'FAILED', 'auto');
@@ -1684,6 +1690,205 @@ export async function cmdEvents({ cwd, tail }) {
   return { ok: true, count: last.length };
 }
 
+// ---------- 命令: worktree ----------
+
+const WORKTREE_DIR = '.worktrees';
+// slug 校验: 对齐 agent 命名规则, 拒绝非法输入
+const WORKTREE_SLUG_RE = /^[a-z][a-z0-9-]{0,31}$/;
+
+// git worktree 输出的路径是 realpath (如 /private/var/...), 本地拼的可能是符号链接形式 (/var/...)。
+// 比较前统一 realpath; 目录不存在时回退 path.resolve。
+function resolveWorktreePath(cwd, p) {
+  try {
+    return realpathSync(path.resolve(cwd, p));
+  } catch {
+    return path.resolve(cwd, p);
+  }
+}
+
+// 跑 git 并捕获 stdout/stderr: 返回 { status, stdout, stderr }
+function runGit(cwd, args) {
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+  return { status: r.status, stdout: (r.stdout ?? '').trim(), stderr: (r.stderr ?? '').trim() };
+}
+
+// 解析 `git worktree list --porcelain` 输出 → [{ path, branch|null, detached }]
+function listWorktrees(cwd) {
+  const r = runGit(cwd, ['worktree', 'list', '--porcelain']);
+  if (r.status !== 0) return { ok: false, error: r.stderr || r.stdout, items: [] };
+  const items = [];
+  let cur = null;
+  for (const line of r.stdout.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      if (cur) items.push(cur);
+      cur = { path: line.slice('worktree '.length).trim(), branch: null, detached: false };
+    } else if (cur && line.startsWith('branch ')) {
+      cur.branch = line.slice('branch '.length).trim().replace(/^refs\/heads\//, '');
+    } else if (cur && line === 'detached') {
+      cur.detached = true;
+    }
+  }
+  if (cur) items.push(cur);
+  return { ok: true, items };
+}
+
+function worktreeJson({ id, result }) {
+  return JSON.stringify({ id, type: 'worktree', result }, null, 2);
+}
+
+// htask worktree create <slug> [--force]: 在仓库内建 .worktrees/<slug> 并检出 task/<slug> 分支
+async function wtCreate({ cwd, args, json }) {
+  const slug = args.find((a) => a !== '--json');
+  if (!slug) {
+    console.error('❌ 用法: htask worktree create <slug>');
+    process.exitCode = 1;
+    return { ok: false, reason: 'usage' };
+  }
+  if (!WORKTREE_SLUG_RE.test(slug)) {
+    console.error(`❌ slug 非法: ${slug} (需匹配 /^[a-z][a-z0-9-]{0,31}$/, 如 task/auth)`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'invalid-slug' };
+  }
+  const branch = `task/${slug}`;
+  const path_ = path.join(WORKTREE_DIR, slug);
+  const full = resolveWorktreePath(cwd, path_);
+  const { ok, items } = listWorktrees(cwd);
+  if (ok && items.some((w) => w.path === full)) {
+    const msg = `worktree 已存在: ${path_} (branch: ${branch})`;
+    if (json) console.log(worktreeJson({ id: slug, result: { ok: false, error: msg, slug, path: path_, branch } }));
+    else console.error(`❌ ${msg}`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'exists' };
+  }
+  const br = runGit(cwd, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]);
+  if (br.status === 0) {
+    const msg = `分支已存在: ${branch}`;
+    if (json) console.log(worktreeJson({ id: slug, result: { ok: false, error: msg, slug, path: path_, branch } }));
+    else console.error(`❌ ${msg}`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'branch-exists' };
+  }
+  const r = runGit(cwd, ['worktree', 'add', path_, '-b', branch]);
+  if (r.status !== 0) {
+    const msg = `git worktree add 失败:\n${r.stderr || r.stdout}`;
+    if (json) console.log(worktreeJson({ id: slug, result: { ok: false, error: msg, slug, path: path_, branch } }));
+    else console.error(`❌ ${msg}`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'add-failed' };
+  }
+  const result = { ok: true, slug, path: path_, branch, absolutePath: full };
+  if (json) console.log(worktreeJson({ id: slug, result }));
+  else console.log(`✅ worktree 已创建: ${path_} (branch: ${branch})`);
+  return { ok: true, result };
+}
+
+// htask worktree list [--json]: 摘要列出 path / branch / status
+async function wtList({ cwd, json }) {
+  const { ok, items, error } = listWorktrees(cwd);
+  if (!ok) {
+    console.error(`❌ 读取 worktree 列表失败: ${error}`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'list-failed' };
+  }
+  const rows = items.map((w) => {
+    const st = runGit(w.path, ['status', '--porcelain']);
+    const status = w.detached ? 'detached' : st.status === 0 && st.stdout.length > 0 ? 'dirty' : 'clean';
+    return { path: w.path, branch: w.branch ?? '(detached)', status };
+  });
+  if (json) {
+    console.log(worktreeJson({ id: 'list', result: { total: rows.length, worktrees: rows } }));
+    return { ok: true, result: { total: rows.length, worktrees: rows } };
+  }
+  if (rows.length === 0) {
+    console.log('(无 worktree)');
+    return { ok: true, result: { total: 0, worktrees: [] } };
+  }
+  const pad = (s, n) => {
+    s = String(s ?? '');
+    return s.length >= n ? s : s + ' '.repeat(n - s.length);
+  };
+  const w = {
+    path: Math.max(4, ...rows.map((r) => r.path.length)),
+    branch: Math.max(6, ...rows.map((r) => r.branch.length)),
+    status: Math.max(6, ...rows.map((r) => r.status.length)),
+  };
+  console.log(`${pad('PATH', w.path)}  ${pad('BRANCH', w.branch)}  ${pad('STATUS', w.status)}`);
+  for (const r of rows) console.log(`${pad(r.path, w.path)}  ${pad(r.branch, w.branch)}  ${pad(r.status, w.status)}`);
+  return { ok: true, result: { total: rows.length, worktrees: rows } };
+}
+
+// htask worktree remove <slug> [--force]: 校验后清理; 脏 worktree 报错并提示 --force
+async function wtRemove({ cwd, args, json }) {
+  const force = args.includes('--force');
+  const slug = args.find((a) => a !== '--json' && a !== '--force');
+  if (!slug) {
+    console.error('❌ 用法: htask worktree remove <slug> [--force]');
+    process.exitCode = 1;
+    return { ok: false, reason: 'usage' };
+  }
+  if (!WORKTREE_SLUG_RE.test(slug)) {
+    console.error(`❌ slug 非法: ${slug} (需匹配 /^[a-z][a-z0-9-]{0,31}$/)`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'invalid-slug' };
+  }
+  const path_ = path.join(WORKTREE_DIR, slug);
+  const full = resolveWorktreePath(cwd, path_);
+  const { ok, items, error } = listWorktrees(cwd);
+  if (!ok) {
+    console.error(`❌ 读取 worktree 列表失败: ${error}`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'list-failed' };
+  }
+  if (!items.some((w) => w.path === full)) {
+    const msg = `worktree 不存在: ${path_} (先运行 htask worktree create ${slug})`;
+    if (json) console.log(worktreeJson({ id: slug, result: { ok: false, error: msg, slug, path: path_ } }));
+    else console.error(`❌ ${msg}`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'not-found' };
+  }
+  const r = runGit(cwd, ['worktree', 'remove', ...(force ? ['--force'] : []), path_]);
+  if (r.status !== 0) {
+    const detail = r.stderr || r.stdout;
+    if (!force && /is dirty|contains modified|contains untracked|not empty/i.test(detail)) {
+      const msg = `worktree 有未提交改动 (path: ${path_}), 删除被拒绝;\n   先提交/清理改动, 或强制删除: htask worktree remove ${slug} --force`;
+      if (json) console.log(worktreeJson({ id: slug, result: { ok: false, error: msg, slug, path: path_, hint: '--force' } }));
+      else console.error(`❌ ${msg}`);
+      process.exitCode = 1;
+      return { ok: false, reason: 'dirty', hint: '--force' };
+    }
+    const msg = `git worktree remove 失败:\n${detail}`;
+    if (json) console.log(worktreeJson({ id: slug, result: { ok: false, error: msg, slug, path: path_ } }));
+    else console.error(`❌ ${msg}`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'remove-failed' };
+  }
+  const result = { ok: true, slug, path: path_, removed: true };
+  if (json) console.log(worktreeJson({ id: slug, result }));
+  else console.log(`✅ worktree 已删除: ${path_}`);
+  return { ok: true, result };
+}
+
+// 命令分发: htask worktree <create|list|remove> [...]
+export async function cmdWorktree({ cwd, args, json }) {
+  const rest = args.slice();
+  const jsonFlag = rest.includes('--json');
+  if (jsonFlag) rest.splice(rest.indexOf('--json'), 1);
+  const sub = rest[0];
+  const useJson = Boolean(json) || jsonFlag;
+  switch (sub) {
+    case 'create':
+      return await wtCreate({ cwd, args: rest.slice(1), json: useJson });
+    case 'list':
+      return await wtList({ cwd, json: useJson });
+    case 'remove':
+      return await wtRemove({ cwd, args: rest.slice(1), json: useJson });
+    default:
+      console.error(`❌ 未知 worktree 子命令: ${sub ?? ''} (可用: create / list / remove)`);
+      process.exitCode = 1;
+      return { ok: false, reason: 'unknown-subcommand' };
+  }
+}
+
 // ---------- CLI 入口 ----------
 
 function printHelp() {
@@ -1704,6 +1909,9 @@ function printHelp() {
   htask policy
   htask events [--tail N]
   htask report
+  htask worktree create <slug>   创建独立工作区 .worktrees/<slug> (分支 task/<slug>)
+  htask worktree list [--json]   列出 worktree (path / branch / status)
+  htask worktree remove <slug> [--force]
   htask --help
 
 选项:
@@ -1792,6 +2000,9 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
       break;
     case 'report':
       await cmdReport({ cwd });
+      break;
+    case 'worktree':
+      await cmdWorktree({ cwd, args: rest, json: opts.json });
       break;
     default:
       console.error(`❌ 未知命令: ${cmd}`);
