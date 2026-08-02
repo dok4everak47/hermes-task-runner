@@ -64,6 +64,13 @@ import {
   buildStages,
   runPipelineStage,
   stagePrompt,
+  parseStatsTokens,
+  captureTokens,
+  parseSessionUsage,
+  captureTokenUsage,
+  fetchLatestSessionId,
+  fetchStatsText,
+  fetchSessionUsage,
 } from '../bin/htask.mjs';
 
 async function makeTempDir(t) {
@@ -2631,4 +2638,363 @@ test('main 分发: htask metrics 可达', async (t) => {
   assert.equal(exitCode, 0);
   assert.ok(logs.some((l) => l.includes('TTV')));
   assert.ok(logs.some((l) => l.includes('等待占比')));
+});
+
+// ---------- Token 捕获 (parseStatsTokens / captureTokens / parseSessionUsage) ----------
+
+test('parseStatsTokens: 解析 opencode stats 文本表 → token 对象 (K/M 换算, total=和)', () => {
+  const text = `┌───────────────────────────────┐
+│          OVERVIEW            │
+├───────────────────────────────┤
+│Sessions                   120 │
+├───────────────────────────────┤
+│        COST & TOKENS          │
+│Total Cost               $3.25 │
+│Input                    2.0M  │
+│Output                  150.0K │
+│Cache Read               10.5M │
+│Cache Write               2.0K │
+└───────────────────────────────┘`;
+  const t = parseStatsTokens(text);
+  assert.equal(t.input, 2_000_000);
+  assert.equal(t.output, 150_000);
+  assert.equal(t.cacheRead, 10_500_000);
+  assert.equal(t.cacheWrite, 2000);
+  assert.equal(t.total, 2_000_000 + 150_000 + 10_500_000 + 2000);
+  assert.equal(t.cost, 3.25);
+});
+
+test('parseStatsTokens: 纯数字无后缀 + 缺失行 → 对应字段 null 但整体不 null', () => {
+  const text = '│Total Cost       $0.50 │\n│Input             123 │\n';
+  const t = parseStatsTokens(text);
+  assert.equal(t.input, 123);
+  assert.equal(t.output, null);
+  assert.equal(t.cacheRead, null);
+  assert.equal(t.cacheWrite, null);
+  assert.equal(t.cost, 0.5);
+  assert.equal(t.total, 123); // 有值字段求和
+});
+
+test('parseStatsTokens: 格式变化 (无匹配行 / 乱码) → null, 不 crash', () => {
+  assert.equal(parseStatsTokens(null), null);
+  assert.equal(parseStatsTokens(undefined), null);
+  assert.equal(parseStatsTokens(''), null);
+  assert.equal(parseStatsTokens('opencode stats 改版了, 没有表格'), null);
+  assert.equal(parseStatsTokens('│unknown 123 │'), null);
+});
+
+test('captureTokens: stats 前后差量 → 本次 run token 消耗 (after-before)', () => {
+  const before = '│Total Cost       $1.00 │\n│Input             1.0M │\n│Output            50.0K│\n│Cache Read        5.0M │\n│Cache Write       1.0K │\n';
+  const after = '│Total Cost       $1.40 │\n│Input             1.4M │\n│Output            80.0K│\n│Cache Read        8.0M │\n│Cache Write       2.0K │\n';
+  const t = captureTokens(before, after);
+  assert.equal(t.input, 400_000);
+  assert.equal(t.output, 30_000);
+  assert.equal(t.cacheRead, 3_000_000);
+  assert.equal(t.cacheWrite, 1_000);
+  assert.equal(t.cost, 0.4);
+  assert.equal(t.total, 400_000 + 30_000 + 3_000_000 + 1_000);
+});
+
+test('captureTokens: 缺失容错 — 任一文本解析失败 → null; 差值不为负', () => {
+  assert.equal(captureTokens(null, '│Input 1.0M│'), null);
+  assert.equal(captureTokens('│Input 1.0M│', '改版格式'), null);
+  // 差值不为负 (stats 重置/误差保护)
+  const t = captureTokens('│Input 5.0M │', '│Input 2.0M │');
+  assert.equal(t.input, 0);
+  assert.equal(t.total, 0);
+});
+
+test('parseSessionUsage: 解析 opencode export JSON (info.tokens + cost)', () => {
+  const json = JSON.stringify({
+    info: {
+      id: 'ses_x',
+      cost: 0.42,
+      tokens: { input: 75704, output: 888, reasoning: 979, cache: { read: 459776, write: 0 } },
+    },
+    messages: [],
+  });
+  const t = parseSessionUsage(json);
+  assert.equal(t.input, 75704);
+  assert.equal(t.output, 888);
+  assert.equal(t.cacheRead, 459776);
+  assert.equal(t.cacheWrite, 0);
+  assert.equal(t.cost, 0.42);
+  assert.equal(t.total, 75704 + 888 + 459776 + 0);
+});
+
+test('parseSessionUsage: 无 usage / 坏 JSON / 缺字段 → null', () => {
+  assert.equal(parseSessionUsage('{"info":{}}'), null);
+  assert.equal(parseSessionUsage('not json'), null);
+  assert.equal(parseSessionUsage('{"info":{"id":"ses_x"}}'), null);
+  assert.equal(parseSessionUsage(null), null);
+});
+
+// ---------- Token 捕获集成 (fake opencode stats/session/export) ----------
+
+// fake opencode: 支持 stats / session list / export 子命令, 用计数器模拟 run 前后差异。
+//   FAKE_SESSION_DIFF=1: session list 第 1 次 ses_old1, 之后 ses_new1 (模拟 run 新建 session)
+//   FAKE_EXPORT_USAGE=1: export 返回带 usage 的 JSON; =0 返回 {"info":{}} (走 stats 差量 fallback)
+//   FAKE_STATS_GARBAGE=1: stats 输出乱码 (模拟 opencode 改版 → tokens=null)
+async function makeTokenOpencode(dir) {
+  const script = path.join(dir, 'token-opencode.sh');
+  const body = `#!/bin/sh
+DIR="$(dirname "$0")"
+count() {
+  c=$(cat "$DIR/counter" 2>/dev/null); c=\${c:-0}; c=$((c+1)); printf '%s' "$c" > "$DIR/counter"; echo "$c"
+}
+if [ "$1" = "stats" ]; then
+  if [ "\${FAKE_STATS_GARBAGE:-0}" = "1" ]; then
+    echo 'opencode stats 改版, 没有表格'
+    exit 0
+  fi
+  n=$(count)
+  if [ "$n" -le 2 ]; then
+    echo '│Total Cost       $1.00 │'
+    echo '│Input             1.0M │'
+    echo '│Output            50.0K│'
+    echo '│Cache Read        5.0M │'
+    echo '│Cache Write       1.0K │'
+  else
+    echo '│Total Cost       $1.40 │'
+    echo '│Input             1.4M │'
+    echo '│Output            80.0K│'
+    echo '│Cache Read        8.0M │'
+    echo '│Cache Write       2.0K │'
+  fi
+  exit 0
+fi
+if [ "$1" = "session" ] && [ "$2" = "list" ]; then
+  if [ "\${FAKE_SESSION_DIFF:-1}" = "1" ]; then
+    n=$(count)
+    if [ "$n" -le 1 ]; then printf 'ses_old1  Old title\\n'; else printf 'ses_new1  New title\\n'; fi
+  else
+    printf 'ses_old1  Old title\\n'
+  fi
+  exit 0
+fi
+if [ "$1" = "export" ]; then
+  count
+  if [ "\${FAKE_EXPORT_USAGE:-1}" = "1" ]; then
+    printf '%s' '{"info":{"id":"ses_new1","cost":0.42,"tokens":{"input":1200,"output":300,"cache":{"read":450,"write":10}}}}'
+  else
+    printf '%s' '{"info":{}}'
+  fi
+  exit 0
+fi
+printf '%s\\n' "$*" >> "$DIR/fake.log"
+printf 'fake implemented ok\\n'
+exit 0
+`;
+  await writeFile(script, body);
+  await chmod(script, 0o755);
+  return script;
+}
+
+test('captureTokenUsage: 优先 session export (新建 session → export usage)', async (t) => {
+  const dir = await makeTempDir(t);
+  const script = await makeTokenOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    // 模拟 cmdStart: 实现前取基线 (session 快照 + stats), 实现后调 captureTokenUsage
+    const beforeSession = await fetchLatestSessionId(dir);
+    const beforeStats = await fetchStatsText(dir);
+    assert.equal(beforeSession, 'ses_old1');
+    const usage = await captureTokenUsage(dir, { beforeSession, beforeStats });
+    assert.equal(usage.input, 1200);
+    assert.equal(usage.output, 300);
+    assert.equal(usage.cacheRead, 450);
+    assert.equal(usage.cacheWrite, 10);
+    assert.equal(usage.cost, 0.42);
+    assert.equal(usage.total, 1200 + 300 + 450 + 10);
+    assert.equal(usage.source, 'session');
+  });
+});
+
+test('captureTokenUsage: export 无 usage → fallback stats 差量 (source=stats)', async (t) => {
+  const dir = await makeTempDir(t);
+  const script = await makeTokenOpencode(dir);
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+      const beforeSession = await fetchLatestSessionId(dir);
+      const beforeStats = await fetchStatsText(dir);
+      await withEnv('FAKE_EXPORT_USAGE', '0', async () => {
+        const usage = await captureTokenUsage(dir, { beforeSession, beforeStats });
+        assert.equal(usage.source, 'stats');
+        // 差量: 1.0M→1.4M input, 50K→80K output, 5M→8M cacheRead, 1K→2K cacheWrite
+        assert.equal(usage.input, 400_000);
+        assert.equal(usage.output, 30_000);
+        assert.equal(usage.cacheRead, 3_000_000);
+        assert.equal(usage.cacheWrite, 1_000);
+        assert.equal(usage.cost, 0.4);
+      });
+    });
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.ok(warns.some((l) => l.includes('fallback')), '应有 fallback warn');
+});
+
+test('captureTokenUsage: 全部拿不到 → warn + null (不 crash)', async (t) => {
+  const dir = await makeTempDir(t);
+  const script = await makeTokenOpencode(dir);
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+      const beforeSession = await fetchLatestSessionId(dir);
+      await withEnv('FAKE_EXPORT_USAGE', '0', async () => {
+        await withEnv('FAKE_SESSION_DIFF', '0', async () => {
+          await withEnv('FAKE_STATS_GARBAGE', '1', async () => {
+            const usage = await captureTokenUsage(dir, { beforeSession, beforeStats: null });
+            assert.equal(usage, null);
+          });
+        });
+      });
+    });
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.ok(warns.some((l) => l.includes('不可得')), '应有不可得 warn');
+});
+
+test('fetchLatestSessionId / fetchStatsText / fetchSessionUsage: 解析 opencode 输出', async (t) => {
+  const dir = await makeTempDir(t);
+  const script = await makeTokenOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    assert.equal(await fetchLatestSessionId(dir), 'ses_old1'); // 首行 ses_...
+    const stats = await fetchStatsText(dir);
+    assert.ok(String(stats).includes('Input'));
+    const usage = await fetchSessionUsage(dir, 'ses_new1');
+    assert.equal(usage.input, 1200);
+  });
+});
+
+test('cmdStart 端到端: 实现后 task.tokens 写入 (session 路径), metrics.json 同步', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — Token 任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const script = await makeTokenOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md') });
+    assert.equal(res.ok, true);
+  });
+  const tsk = await taskById(dir, await currentId(dir));
+  assert.equal(tsk.status, 'VERIFYING');
+  assert.equal(tsk.tokens.input, 1200);
+  assert.equal(tsk.tokens.output, 300);
+  assert.equal(tsk.tokens.cost, 0.42);
+  assert.equal(tsk.tokens.source, 'session');
+  // metrics.json 同步 tokens
+  const metrics = JSON.parse(
+    await readFile(path.join(dir, '.htask', 'artifacts', tsk.id, 'metrics.json'), 'utf8')
+  );
+  assert.equal(metrics.tokens.input, 1200);
+  assert.equal(metrics.tokens.total, 1200 + 300 + 450 + 10);
+});
+
+test('cmdStart 端到端: token 不可得时 task.tokens=null, 不 crash, 照常到 VERIFYING', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 无 Token 任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const script = await makeTokenOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    await withEnv('FAKE_EXPORT_USAGE', '0', async () => {
+      await withEnv('FAKE_SESSION_DIFF', '0', async () => {
+        await withEnv('FAKE_STATS_GARBAGE', '1', async () => {
+          const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md') });
+          assert.equal(res.ok, true);
+        });
+      });
+    });
+  });
+  const tsk = await taskById(dir, await currentId(dir));
+  assert.equal(tsk.status, 'VERIFYING');
+  assert.equal(tsk.tokens, null);
+});
+
+test('cmdStatus 文本: 展示 Token 一行 (有数据)', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: 'x' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  cur.tokens = { input: 75704, output: 888, cacheRead: 459776, cacheWrite: 0, total: 536368, cost: 0.42 };
+  await writeTask(dir, cur);
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdStatus({ cwd: dir });
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(logs.some((l) => l.includes('Token:') && l.includes('in 75.7K') && l.includes('$0.4200')));
+  // --json 含 tokens 字段
+  logs.length = 0;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdStatus({ cwd: dir, json: true });
+  } finally {
+    console.log = orig;
+  }
+  const j = JSON.parse(logs[0]);
+  assert.equal(j.tokens.total, 536368);
+  assert.equal(j.tokens.cost, 0.42);
+});
+
+// ---------- metrics token 列 ----------
+
+test('computeMetrics: 读 task.tokens, 行含 tokens, 汇总含总 input/output/cost; 旧任务缺失跳过', () => {
+  const good = {
+    ...metricTask('g', { created: '2026-01-01T00:00:00.000Z', delay: 1000, implMs: 1000, waitMs: 1000 }),
+    tokens: { input: 1000, output: 200, cacheRead: 300, cacheWrite: 50, total: 1550, cost: 0.1 },
+  };
+  const old = { ...metricTask('o', { created: '2026-01-02T00:00:00.000Z', delay: 1000, implMs: 1000, waitMs: 1000 }) }; // 无 tokens
+  const r = computeMetrics([good, old]);
+  assert.equal(r.tasks[0].tokens.total, 1550);
+  assert.equal(r.tasks[1].tokens, null);
+  assert.equal(r.summary.tokenTasks, 1);
+  assert.equal(r.summary.totalInputTokens, 1000);
+  assert.equal(r.summary.totalOutputTokens, 200);
+  assert.equal(r.summary.totalTokens, 1550);
+  assert.equal(r.summary.totalCost, 0.1);
+});
+
+test('cmdMetrics 文本: 有 token 列 (任务显示 total, 旧任务显示 -); 汇总含 Token 行', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeTask(
+    dir,
+    metricTask('g', { created: '2026-01-01T00:00:00.000Z', delay: 1000, implMs: 1000, waitMs: 1000 })
+  );
+  let cur = await readTask(dir, 'g');
+  cur.tokens = { input: 2_000_000, output: 150_000, cacheRead: 0, cacheWrite: 0, total: 2_150_000, cost: 3.25 };
+  await writeTask(dir, cur);
+  await writeTask(dir, metricTask('o', { created: '2026-01-02T00:00:00.000Z', delay: 1000, implMs: 1000, waitMs: 1000 }));
+  const run = captureOutput(() => cmdMetrics({ cwd: dir }));
+  const { logs, exitCode } = await run();
+  assert.equal(exitCode, 0);
+  const out = logs.join('\n');
+  assert.ok(out.includes('Token'), '表头应含 Token 列');
+  assert.ok(out.includes('2.2M'), '有 token 的任务显示 total');
+  assert.ok(out.includes('总 input 2.0M'), '汇总含总 input');
+  assert.ok(out.includes('总成本 $3.2500'), '汇总含总成本');
+});
+
+test('cmdMetrics --json: 行含 tokens, summary 含 token 汇总; 无 token 数据不 crash', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeTask(dir, metricTask('j', { created: '2026-01-01T00:00:00.000Z', delay: 1000, implMs: 1000, waitMs: 2000 }));
+  const run = captureOutput(() => cmdMetrics({ cwd: dir, json: true }));
+  const { logs, exitCode } = await run();
+  assert.equal(exitCode, 0);
+  const obj = JSON.parse(logs.join('\n'));
+  assert.equal(obj.result.tasks[0].tokens, null); // 旧任务 tokens null
+  assert.equal(obj.result.summary.tokenTasks, 0);
+  assert.equal(obj.result.summary.totalTokens, null);
 });

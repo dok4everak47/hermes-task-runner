@@ -1,89 +1,76 @@
-# TASK — Dynamic Pipeline：按 plan.pipeline 动态驱动执行序列
+# TASK — Token 记录：捕获 OpenCode 真实 token 消耗进 metrics
 
 ## Value Statement
 
-- **谁受益**: 你——任务按类型走对的流程（bug 修复不浪费 reviewer、架构任务有 architect 前置），少花 token 少等时间
-- **解决什么**: plan.pipeline 只记录不执行，所有任务走同一固定流程（developer→reviewer→tester），小任务也被 review 拖慢
-- **省多少时间**: 无 reviewer 的任务省一次 agent 调用（数分钟 + token）
-- **改变什么行为**: 任务流程从"一刀切"变为"按 planner 分析结果定制"
+- **谁受益**: 你——终于知道每个任务花了多少 token/钱（你一直关心成本）
+- **解决什么**: metrics.json 有 tokens 字段但永远 null；"哪种任务适合哪个模型/哪个 Prompt 最贵"无法分析
+- **省多少时间**: token 消耗自动记录，不用猜；长期数据支撑模型选型
+- **改变什么行为**: 从"不知道花多少"变为"每任务 token 可审计"
 
 ## Goal
 
-让 htask 按 plan.pipeline 真正驱动执行序列（对齐演进建议 #2 Dynamic Pipeline）。
-Before: pipeline 只是 JSON 里的记录。After: pipeline 元素决定实际执行的 agent 阶段。
+让 htask 捕获每次 OpenCode 执行的 token 消耗，写入 task.tokens + metrics.json + metrics 输出。
+Before: tokens 字段空置。After: 每任务 token/成本可见，长期可分析。
 
 ## Context
 
-- 演进建议 Hermes_Task_Runner_演进建议.md #2:
-  - Bug 修复: Developer → Test → Verify（无 reviewer）
-  - 架构修改: Architect → Developer → Reviewer → Security Review → Verify
-  - 文档任务: Writer → Proofread
-- 现状: cmdStart（bin/htask.mjs L880+）固定流程（spawn developer 实现 → [可选 reviewer] → verify）；plan.pipeline 在 L946 打印、L1863 推荐，不驱动
-- plan 结构: { complexity, risk[], pipeline[], suggestModel, suggestReview }
-- pipeline 元素（planner 生成）: architect / developer / schema-check / security-reviewer / reviewer / tester / writer / proofread
-- reviewer agent: ~/.config/opencode/agents/reviewer.md（htask --review 时用）
+- 演进建议 #9 Metrics System（结合 TokenTracker）: task/tokens/duration/iterations/success 记录 + 长期分析（模型选型/Prompt 效果/Token 优化）
+- metrics.json 已有 tokens 字段（L269: `tokens: task.tokens ?? null`）——缺捕获端
+- opencode 能力（已实测）:
+  - `opencode stats` 文本表格（Sessions/Messages + Total Cost/Input/Output/Cache Read/Write），**无 --json**
+  - `opencode session list` / `opencode export <sessionID>`（session 数据 JSON，含 usage?）
+  - `opencode run --print-logs`（stderr 详细日志，可能含 token）
+  - opencode 数据目录: ~/.local/share/opencode/（session 存储）
+- 已知限制: stats 是全局累计（所有会话），并发 opencode 会话（如 herdr pane 里另一个）会污染差量
 
 ## Current Behavior
 
-- 所有任务: spawn developer（实现）→ 验证（verify 命令）→ [--review 时跑 reviewer]
-- plan.pipeline 不参与执行决策
+- task.tokens 永远 null；metrics 输出无 token 列
 
 ## Expected Behavior
 
-- cmdStart 按 plan.pipeline 决定执行序列（无 plan 的旧任务保持现状向后兼容）:
-  - pipeline 含 `architect` → developer 前跑一次架构分析 prompt（普通 opencode run，不指定 agent 角色）
-  - pipeline 含 `reviewer` → 现有 reviewer 流程（等价 --review）
-  - pipeline 含 `security-reviewer` → verify 前跑安全检查 prompt
-  - pipeline **不含** `reviewer` 且未显式 --review → 跳过 reviewer（省 token）——但 review 字段记为 skipped
-  - `developer`/`tester` 元素不新增行为（developer=现有实现，tester=现有 verify）
-- 执行顺序: architect → developer → [security-reviewer] → verify → [reviewer 若在 pipeline 尾部?] —— 按文档: 架构=Architect→Developer→Reviewer→Security→Verify；bug=Developer→Verify
-- 具体顺序映射（pipeline 元素 → 执行位置）:
-  - architect: 实现前（前置 prompt）
-  - developer: 实现（现有）
-  - reviewer: verify 后（现有 reviewer 逻辑）
-  - security-reviewer: verify 前（安全检查 prompt）
-  - schema-check: verify 前（只跑 plan 检查类 prompt, 不阻塞）
-- 每个新阶段: spawn opencode run（复用 runAgent/适配器），输出追加到 .htask/logs/<task-id>.log，失败不中断主流程（记 warn），阶段结果写进 task JSON（`stages: [{name, exitCode, durationMs, output}]`）
-- 跳过 reviewer 时 task.review = { status: "skipped", reason: "pipeline" }
+- 每次 OpenCode 实现完成后，task.tokens 写入 { input, output, cacheRead, cacheWrite, total, cost? }（能拿到多少拿多少，拿不到对应字段 null）
+- metrics.json（artifacts）+ htask metrics 输出新增 token 列（每任务 + 汇总）
+- 优先方案（准确）: 按本次 run 的 session 拿 usage——spawn 时记录 opencode session（如 `opencode run --session <id>` 或 spawn 后查最新 session export）；若 session export 无 usage 字段，fallback 到 stats 差量（标注并发限制）
+- 拿不到 token 的任务: tokens 保持 null，metrics 标注"—"（不 crash）
+- 向后兼容: 旧任务无 tokens 不影响 metrics 汇总（缺失跳过）
 
 ## Design
 
-- cmdStart 重构: 把"实现 → 验证 → 审查"改为 pipeline 驱动的阶段循环
-  - `const stages = buildStages(plan)` → [{name:'architect', before:'implement'}, {name:'developer'}, ...]
-  - 现有代码路径保留（无 plan 任务走旧逻辑）
-- 新增 `function buildStages(plan)`: plan.pipeline → 有序阶段列表（含位置标记）
-- 新增 `function runPipelineStage(cwd, backend, stage, prompt, logName)`: 复用 runAgent（architect/security-reviewer 用普通 prompt，不传 --agent；reviewer 用现有逻辑）
-- task JSON 加 `stages` 数组（记录每阶段 exitCode/durationMs/output 摘要）
-- htask status/list 展示 stages 摘要（可选，一行）
+- spawn 方案（二选一，实现者按实测选择，README 里写清理由）:
+  - 方案 A（推荐先试）: spawn 前 `opencode session list --json?` 快照最新 session id；run 完成后 export 该 id 解析 usage（若无 --json，解析文本/JSON）
+  - 方案 B: run 前后各跑一次 `opencode stats`（解析文本表 Input/Output/Cache Read/Cache Write 行），差值写入；并发会话时数据可能偏大（注释说明）
+- 新增 `function captureTokens(cwd, before, after)`: 差量/解析逻辑（纯函数可单测，输入 stats 文本）
+- spawnOpenCode/runAgent 完成后调用: `task.tokens = await captureTokenUsage(...)`，写 task JSON
+- metrics: computeMetrics 读 task.tokens，输出加 token 列（总 input/output/cost，若都有）
+- `htask status` 展示 tokens（一行）
 
 ## Files
 
-- bin/htask.mjs: buildStages + runPipelineStage + cmdStart 重构 + task.stages 字段
-- test/htask.test.mjs: pipeline 测试（含 reviewer 跳过/architect 前置/无 plan 兼容）
+- bin/htask.mjs: captureTokenUsage + spawn 集成 + metrics token 列
+- test/htask.test.mjs: token 解析/差量/缺失容错测试
 
 ## Constraints
 
-- 无 plan 任务 / 旧任务行为完全不变（向后兼容）
-- 新阶段失败不阻塞主流程（warn + 记录）
-- reviewer 显式 --review 始终优先于 pipeline（用户显式要求时）
-- 不引新依赖
-- token 控制: 每新增阶段是独立 prompt，保持 prompt 简短（一两句指令）
+- 不引新依赖（child_process 已有）
+- token 拿不到绝不 crash（null + 标注）
+- metrics 输出对齐现有文本/JSON 格式
+- 旧任务（无 tokens）metrics 正常（缺失跳过）
+- stats 解析基于当前表格格式（若 opencode 改版导致解析失败 → warn + null，不硬失败）
 
 ## Acceptance Criteria
 
-- pipeline 含 reviewer → 跑 reviewer；不含 → 跳过且 review=skipped
-- pipeline 含 architect → 实现前有 architect 阶段记录
-- 阶段结果写入 task.stages（name/exitCode/durationMs）
-- 无 plan 任务流程不变
-- 单测 ≥ 6（跳过/前置/顺序/兼容/失败不阻塞/显式 --review 优先）
-- 全部测试通过（119 + 新增）+ 冒烟
+- 真实任务跑完 task.tokens 非 null（input/output 至少一项有值）或明确标注不可得（warn 说明原因）
+- metrics 输出含 token 列（有数据的任务显示，无数据显示 —）
+- 单测 ≥ 5（stats 文本解析/差量/缺失容错/格式变化 warn）
+- 全部测试通过（128 + 新增）
 
 ## Verification Commands
 
 ```bash
 node --check bin/htask.mjs
 node --test "test/*.test.mjs"
-# 冒烟: 构造 plan 不含 reviewer 的任务 → 验证跳过
+# 冒烟: 跑一个最小 opencode run, 验证 task.tokens 被写入
 ```
 
 ## Rollback Plan

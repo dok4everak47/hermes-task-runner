@@ -769,6 +769,182 @@ export async function runAgent(cwd, backend, { model, agent } = {}, prompt, logN
   return spawnAgentCmd(cwd, adapter.runCmd[0], fullArgs, logName, adapter.env);
 }
 
+// ---------- Token 捕获 (opencode stats / session export) ----------
+
+// 运行 opencode 子命令并返回 stdout 文本; 失败 (非 0 / 无输出 / spawn 错误) → null
+function runOpenCodeCmd(cwd, args) {
+  const cmd = process.env.HTASK_OPENCODE_CMD || 'opencode';
+  let r;
+  try {
+    r = spawnSync(cmd, args, { cwd, encoding: 'utf8', timeout: 20_000 });
+  } catch {
+    return null;
+  }
+  if (r.status !== 0 || !r.stdout) return null;
+  return r.stdout;
+}
+
+// "19.0M" / "224.3K" / "123" → 整数 token 数 (识别失败 → null)
+function parseTokenCount(s) {
+  if (typeof s === 'number') return Number.isFinite(s) ? s : null;
+  const m = String(s).trim().match(/^([\d.]+)\s*([KMB])?$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return null;
+  const mult = { K: 1e3, M: 1e6, B: 1e9 }[(m[2] || '').toUpperCase()] ?? 1;
+  return Math.round(n * mult);
+}
+
+function sumTokens(arr) {
+  const vals = arr.filter((v) => typeof v === 'number' && Number.isFinite(v));
+  return vals.length === 0 ? null : vals.reduce((a, b) => a + b, 0);
+}
+
+// 解析 opencode stats 文本表 → { input, output, cacheRead, cacheWrite, total, cost }
+// total = input+output+cacheRead+cacheWrite 之和; 表格格式变化无法识别 → null
+// (调用方 warn 后置 null, 不硬失败 — opencode 改版兼容)
+export function parseStatsTokens(text) {
+  if (!text || typeof text !== 'string') return null;
+  const match = (label) => {
+    // opencode stats 表格边框用 U+2502 (│), 兼容 ASCII | 双匹配
+    const re = new RegExp(`[│|]\\s*${label}\\s+([\\d.,KMB]+)`);
+    const m = text.match(re);
+    return m ? parseTokenCount(m[1]) : null;
+  };
+  const input = match('Input');
+  const output = match('Output');
+  const cacheRead = match('Cache Read');
+  const cacheWrite = match('Cache Write');
+  const costM = text.match(/Total Cost\s+\$?([\d.]+)/);
+  const cost = costM && Number.isFinite(Number(costM[1])) ? Number(costM[1]) : null;
+  if (input === null && output === null && cacheRead === null && cacheWrite === null && cost === null) {
+    return null;
+  }
+  return { input, output, cacheRead, cacheWrite, total: sumTokens([input, output, cacheRead, cacheWrite]), cost };
+}
+
+// 纯函数: stats 前后差量 → 本次 run 的 token 消耗 (after - before)。
+// 任一文本解析失败 → null (格式变化, 调用方 warn)。
+export function captureTokens(beforeStatsText, afterStatsText) {
+  const b = parseStatsTokens(beforeStatsText);
+  const a = parseStatsTokens(afterStatsText);
+  if (!b || !a) return null;
+  const diff = (key) => {
+    if (a[key] === null || b[key] === null) return null;
+    return Math.max(0, a[key] - b[key]);
+  };
+  const input = diff('input');
+  const output = diff('output');
+  const cacheRead = diff('cacheRead');
+  const cacheWrite = diff('cacheWrite');
+  // 成本差量做 4 位小数舍入, 避免浮点误差 (1.40 - 1.00 = 0.3999...)
+  const cost =
+    a.cost !== null && b.cost !== null ? Math.max(0, Math.round((a.cost - b.cost) * 10000) / 10000) : null;
+  if (input === null && output === null && cacheRead === null && cacheWrite === null) return null;
+  return { input, output, cacheRead, cacheWrite, total: sumTokens([input, output, cacheRead, cacheWrite]), cost };
+}
+
+// 从 opencode 子命令输出中提取 JSON 对象: 容忍前置杂音 (如 shell 回显 "3\n{...}")。
+// 直接 parse 失败时扫描首个顶层对象 (处理字符串转义); 找不到 → 抛错。
+function extractJson(text) {
+  const s = String(text);
+  try {
+    return JSON.parse(s);
+  } catch {
+    /* 有前置杂音, 尝试扫描 */
+  }
+  const start = s.indexOf('{');
+  if (start === -1) throw new Error('未找到 JSON 对象');
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) return JSON.parse(s.slice(start, i + 1));
+    }
+  }
+  throw new Error('未找到完整 JSON 对象');
+}
+
+// 解析 opencode export <sessionID> 的 JSON → token 对象 (info.tokens + info.cost)。
+// 无 usage / 解析失败 → null。
+export function parseSessionUsage(json) {
+  let data;
+  try {
+    data = typeof json === 'string' ? extractJson(json) : json;
+  } catch {
+    return null;
+  }
+  const t = data?.info?.tokens;
+  if (!t || typeof t !== 'object') return null;
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const input = num(t.input);
+  const output = num(t.output);
+  const cacheRead = num(t.cache?.read);
+  const cacheWrite = num(t.cache?.write);
+  const cost = num(data?.info?.cost);
+  if (input === null && output === null && cacheRead === null && cacheWrite === null && cost === null) return null;
+  return { input, output, cacheRead, cacheWrite, total: sumTokens([input, output, cacheRead, cacheWrite]), cost };
+}
+
+// 当前最新 session id (opencode session list 首行 ses_...); 失败 → null
+export async function fetchLatestSessionId(cwd) {
+  const out = runOpenCodeCmd(cwd, ['session', 'list']);
+  if (!out) return null;
+  const m = String(out).match(/^(?:ses_|session_)[A-Za-z0-9]+/m);
+  return m ? m[0] : null;
+}
+
+export async function fetchStatsText(cwd) {
+  return runOpenCodeCmd(cwd, ['stats']);
+}
+
+// 导出 session → token 对象 (无 usage / 失败 → null)
+export async function fetchSessionUsage(cwd, sessionId) {
+  if (!sessionId) return null;
+  const out = runOpenCodeCmd(cwd, ['export', sessionId]);
+  if (!out) return null;
+  return parseSessionUsage(out);
+}
+
+// 实现完成后捕获 token: 优先方案 A (session export, 精确到本次实现会话),
+// 无 usage 时 fallback 方案 B (stats 前后差量, 并发 opencode 会话时数据可能偏大)。
+// 全部拿不到 → warn + null (不 crash, 向后兼容旧任务)。
+export async function captureTokenUsage(cwd, { beforeSession, beforeStats } = {}) {
+  const afterSession = await fetchLatestSessionId(cwd);
+  const afterStats = await fetchStatsText(cwd);
+  if (afterSession && afterSession !== beforeSession) {
+    const usage = await fetchSessionUsage(cwd, afterSession);
+    if (usage) return { ...usage, source: 'session' };
+    console.warn('⚠️ opencode session export 无 usage, fallback 到 stats 差量');
+  }
+  const tokens = captureTokens(beforeStats, afterStats);
+  if (tokens) return { ...tokens, source: 'stats' };
+  console.warn('⚠️ opencode token 数据不可得 (stats 解析失败/命令失败), task.tokens=null');
+  return null;
+}
+
+// 格式化 token 数: 123 → "123", 12.3K/M/B (NaN/缺失 → "-")
+// 用整数十分位舍入避免浮点误差 (2150000 → 2.2M, 2000000 → 2.0M)
+function fmtTokens(n) {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return '-';
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return `${(Math.round(n / 1e8) / 10).toFixed(1)}B`;
+  if (abs >= 1e6) return `${(Math.round(n / 1e5) / 10).toFixed(1)}M`;
+  if (abs >= 1e3) return `${(Math.round(n / 1e2) / 10).toFixed(1)}K`;
+  return String(n);
+}
+
 // ---------- Dynamic Pipeline (buildStages / runPipelineStage) ----------
 
 // pipeline 元素 → 执行位置:
@@ -1058,6 +1234,10 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
       await runStage(s.name, stagePrompt(s.name, path.basename(taskFile)));
     }
 
+    // 捕获 token 基线 (本次实现 run 的 session / stats 快照)
+    const beforeSession = await fetchLatestSessionId(cwd);
+    const beforeStats = await fetchStatsText(cwd);
+
     const implement = await runAgent(
       cwd,
       backend.backend,
@@ -1068,6 +1248,7 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     task = await readTask(cwd, task.id);
     task.implementExit = implement.exitCode;
     task.implementDurationMs = implement.durationMs;
+    task.tokens = await captureTokenUsage(cwd, { beforeSession, beforeStats });
     task.updatedAt = new Date().toISOString();
     stages.push({
       name: 'developer',
@@ -1538,10 +1719,13 @@ export async function cmdRetry({ cwd, id, fix, yes }) {
 
   const backend = task.agentBackend || process.env.HTASK_AGENT || 'opencode';
   const logName = `logs/${task.id}.log`;
+  const beforeSession = await fetchLatestSessionId(cwd);
+  const beforeStats = await fetchStatsText(cwd);
   const implement = await runAgent(cwd, backend, { model: task.model, agent: task.agent }, buildRetryPrompt(task), logName);
   let cur = await readTask(cwd, task.id);
   cur.implementExit = implement.exitCode;
   cur.implementDurationMs = implement.durationMs;
+  cur.tokens = await captureTokenUsage(cwd, { beforeSession, beforeStats });
   cur.updatedAt = new Date().toISOString();
   await writeTask(cwd, cur);
 
@@ -1600,6 +1784,7 @@ export function taskToJson(task) {
     verification: task.verification ?? verificationSummary(task.verify ?? []),
     verify: (task.verify ?? []).map((r) => ({ command: r.command, exitCode: r.exitCode })),
     stages: (task.stages ?? []).map((s) => ({ name: s.name, exitCode: s.exitCode, durationMs: s.durationMs })),
+    tokens: task.tokens ?? null,
     historyCount: (task.history ?? []).length,
     startedAt: task.startedAt,
     updatedAt: task.updatedAt,
@@ -1647,6 +1832,17 @@ function printTaskDetail(task) {
   );
   if (task.implementExit !== undefined && task.implementExit !== null) {
     console.log(`实现: exit ${task.implementExit} (${fmtDuration(task.implementDurationMs)})`);
+  }
+  const t = task.tokens;
+  if (t && typeof t === 'object') {
+    const parts = [];
+    if (t.input !== null) parts.push(`in ${fmtTokens(t.input)}`);
+    if (t.output !== null) parts.push(`out ${fmtTokens(t.output)}`);
+    if (t.cacheRead !== null) parts.push(`cacheR ${fmtTokens(t.cacheRead)}`);
+    if (t.cacheWrite !== null) parts.push(`cacheW ${fmtTokens(t.cacheWrite)}`);
+    if (t.total !== null) parts.push(`total ${fmtTokens(t.total)}`);
+    if (t.cost !== null) parts.push(`$${t.cost.toFixed(4)}`);
+    console.log(`Token: ${parts.length > 0 ? parts.join(' · ') : '—'}${t.source ? ` (来源: ${t.source})` : ''}`);
   }
   if (Array.isArray(task.verify) && task.verify.length > 0) {
     const pass = task.verify.filter((r) => r.exitCode === 0).length;
@@ -1740,6 +1936,28 @@ export async function cmdReport({ cwd }) {
   console.log('📝 REPORT.md 已根据已有状态重新生成');
 }
 
+// ---------- 命令: progress ----------
+
+// 实时进度条: 读 .htask/progress.json 显示 ASCII 进度条 (菜单栏/手机端的数据源可视化)
+export async function cmdProgress({ cwd }) {
+  try {
+    const raw = await readFile(path.join(cwd, '.htask', 'progress.json'), 'utf8');
+    const p = JSON.parse(raw);
+    const width = 10;
+    const prog = typeof p.progress === 'number' ? p.progress : 0;
+    const filled = Math.max(0, Math.min(width, Math.round((prog / 100) * width)));
+    const bar = '█'.repeat(filled) + '░'.repeat(width - filled);
+    console.log(`Progress: ${bar} ${prog}%`);
+    console.log(`Task:     ${p.taskId ?? '-'}`);
+    console.log(`Stage:    ${p.stage ?? '-'}`);
+    console.log(`Status:   ${p.status ?? '-'}`);
+    if (p.currentAction) console.log(`Current:  ${p.currentAction}`);
+    console.log(`Updated:  ${p.updatedAt ?? '-'}`);
+  } catch {
+    console.log('Progress: 无进行中任务 (progress.json 缺失或为空)');
+  }
+}
+
 // ---------- 命令: metrics ----------
 
 // 从任务 history 提取首次到达某状态的 at 时间戳 (to=状态 的 at)
@@ -1751,9 +1969,10 @@ function historyAt(task, status) {
   return null;
 }
 
-// 纯函数: 每任务 TTV/实现耗时/等人 accept 耗时 + 汇总 (平均 TTV、等待占比、瓶颈排序)
+// 纯函数: 每任务 TTV/实现耗时/等人 accept 耗时/token + 汇总 (平均 TTV、等待占比、瓶颈排序)
 //  - TTV = merged - created；wait_human = accepted - verifying；impl = implementDurationMs
 //  - 缺 history / 缺阶段时间戳的任务不 crash, 标 missing, 不参与汇总
+//  - token: 读 task.tokens (input/output/cacheRead/cacheWrite/total/cost), 缺失标 null, 不参与汇总
 export function computeMetrics(tasks) {
   const rows = (Array.isArray(tasks) ? tasks : []).map((task) => {
     const hasHistory = Array.isArray(task?.history) && task.history.length > 0;
@@ -1773,6 +1992,7 @@ export function computeMetrics(tasks) {
     const ttv = diffMs(created, merged);
     const waitHuman = diffMs(verifying, accepted);
     const impl = typeof task.implementDurationMs === 'number' && Number.isFinite(task.implementDurationMs) ? task.implementDurationMs : null;
+    const tokens = task?.tokens && typeof task.tokens === 'object' ? task.tokens : null;
 
     const missing = [];
     if (!hasHistory) missing.push('history');
@@ -1793,6 +2013,7 @@ export function computeMetrics(tasks) {
       ttvMs: ttv,
       implMs: impl,
       waitHumanMs: waitHuman,
+      tokens,
       missing,
     };
   });
@@ -1809,6 +2030,15 @@ export function computeMetrics(tasks) {
     .sort((a, b) => b.waitHumanMs - a.waitHumanMs)
     .map((r) => ({ id: r.id, waitHumanMs: r.waitHumanMs }));
 
+  // token 汇总: 只统计 tokens 非 null 的任务 (旧任务/缺失跳过), 每字段各自求有值之和
+  const withTokens = rows.filter((r) => r.tokens);
+  const tokenSum = (key) => {
+    const vals = withTokens
+      .map((r) => (typeof r.tokens[key] === 'number' && Number.isFinite(r.tokens[key]) ? r.tokens[key] : null))
+      .filter((v) => v !== null);
+    return vals.length === 0 ? null : vals.reduce((a, b) => a + b, 0);
+  };
+
   return {
     tasks: rows,
     summary: {
@@ -1820,6 +2050,13 @@ export function computeMetrics(tasks) {
       totalImplMs: totalImpl,
       waitRatio,
       bottlenecks: bottlenecks.slice(0, 3),
+      tokenTasks: withTokens.length,
+      totalInputTokens: tokenSum('input'),
+      totalOutputTokens: tokenSum('output'),
+      totalCacheReadTokens: tokenSum('cacheRead'),
+      totalCacheWriteTokens: tokenSum('cacheWrite'),
+      totalTokens: tokenSum('total'),
+      totalCost: tokenSum('cost'),
     },
   };
 }
@@ -1844,17 +2081,37 @@ export async function cmdMetrics({ cwd, json }) {
     return s.length >= n ? s : s + ' '.repeat(n - s.length);
   };
   const mark = (r) => (r.missing.length === 0 ? '' : ` ⚠️缺${r.missing.join('/')}`);
+  // 每任务 token 展示: "in X / out Y" (有 total 时优先 total), 无数据 → "-"
+  const tokenCell = (r) => {
+    const t = r.tokens;
+    if (!t) return '-';
+    if (typeof t.total === 'number' && Number.isFinite(t.total)) return fmtTokens(t.total);
+    if (t.input !== null || t.output !== null) {
+      return `in ${fmtTokens(t.input)}/out ${fmtTokens(t.output)}`;
+    }
+    return '-';
+  };
+  const costCell = (r) => {
+    const c = r.tokens?.cost;
+    return typeof c === 'number' && Number.isFinite(c) ? `$${c.toFixed(2)}` : '-';
+  };
 
   const w = {
     id: Math.max(2, ...rows.map((r) => String(r.id).length)),
     ttv: Math.max(3, ...rows.map((r) => fmt(r.ttvMs).length)),
     impl: Math.max(6, ...rows.map((r) => fmt(r.implMs).length)),
     wait: Math.max(10, ...rows.map((r) => fmt(r.waitHumanMs).length)),
+    token: Math.max(5, ...rows.map((r) => tokenCell(r).length)),
+    cost: Math.max(4, ...rows.map((r) => costCell(r).length)),
     status: Math.max(4, ...rows.map((r) => String(r.status).length)),
   };
-  console.log(`${pad('ID', w.id)}  ${pad('TTV', w.ttv)}  ${pad('实现', w.impl)}  ${pad('等人 accept', w.wait)}  ${pad('状态', w.status)}  备注`);
+  console.log(
+    `${pad('ID', w.id)}  ${pad('TTV', w.ttv)}  ${pad('实现', w.impl)}  ${pad('等人 accept', w.wait)}  ${pad('Token', w.token)}  ${pad('成本', w.cost)}  ${pad('状态', w.status)}  备注`
+  );
   for (const r of rows) {
-    console.log(`${pad(r.id, w.id)}  ${pad(fmt(r.ttvMs), w.ttv)}  ${pad(fmt(r.implMs), w.impl)}  ${pad(fmt(r.waitHumanMs), w.wait)}  ${pad(r.status, w.status)}  ${mark(r)}`);
+    console.log(
+      `${pad(r.id, w.id)}  ${pad(fmt(r.ttvMs), w.ttv)}  ${pad(fmt(r.implMs), w.impl)}  ${pad(fmt(r.waitHumanMs), w.wait)}  ${pad(tokenCell(r), w.token)}  ${pad(costCell(r), w.cost)}  ${pad(r.status, w.status)}  ${mark(r)}`
+    );
   }
 
   const s = summary;
@@ -1862,6 +2119,12 @@ export async function cmdMetrics({ cwd, json }) {
   console.log(
     `汇总: ${s.complete}/${s.total} 任务完整 · 平均 TTV ${fmt(s.avgTtvMs)} · 总等待 ${fmt(s.totalWaitMs)} vs 总实现 ${fmt(s.totalImplMs)} · 等待占比 ${s.waitRatio !== null ? `${(s.waitRatio * 100).toFixed(1)}%` : '-'}`
   );
+  if (s.tokenTasks > 0) {
+    console.log(
+      `Token: ${s.tokenTasks} 个任务有记录 · 总 input ${fmtTokens(s.totalInputTokens)} · 总 output ${fmtTokens(s.totalOutputTokens)} · 总 ${fmtTokens(s.totalTokens)}` +
+        `${s.totalCost !== null ? ` · 总成本 $${s.totalCost.toFixed(4)}` : ''}`
+    );
+  }
   if (s.bottlenecks.length > 0) {
     console.log(`瓶颈: ${s.bottlenecks.map((b) => `${b.id} (${fmt(b.waitHumanMs)})`).join(' > ')}`);
   }
@@ -2241,7 +2504,7 @@ function printHelp() {
   htask policy
   htask events [--tail N]
   htask report
-  htask metrics [--json]           每任务 TTV/实现耗时/等人 accept 耗时 + 汇总 (平均 TTV、等待占比、瓶颈)
+  htask metrics [--json]           每任务 TTV/实现耗时/等人 accept 耗时/token + 汇总 (平均 TTV、等待占比、瓶颈)
   htask worktree create <slug>   创建独立工作区 .worktrees/<slug> (分支 task/<slug>)
   htask worktree list [--json]   列出 worktree (path / branch / status)
   htask worktree remove <slug> [--force]
@@ -2336,6 +2599,9 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
       break;
     case 'metrics':
       await cmdMetrics({ cwd, json: opts.json });
+      break;
+    case 'progress':
+      await cmdProgress({ cwd });
       break;
     case 'worktree':
       await cmdWorktree({ cwd, args: rest, json: opts.json });
