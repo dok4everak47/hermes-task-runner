@@ -56,6 +56,8 @@ import {
   parseApprovalYaml,
   approvalDecision,
   cmdWorktree,
+  computeMetrics,
+  cmdMetrics,
 } from '../bin/htask.mjs';
 
 async function makeTempDir(t) {
@@ -2092,4 +2094,114 @@ test('main 分发: worktree 命令可达', async (t) => {
   assert.ok(logs.some((l) => l.includes('✅ worktree 已创建')));
   const list = execSync('git worktree list', { cwd: dir, encoding: 'utf8' });
   assert.ok(list.includes('task/mwt'));
+});
+
+// ---------- computeMetrics ----------
+
+// 构造带指定 history 时间戳的任务 (created→…→merged 依次各+delayMs)
+function metricTask(id, { created, delay = 1000, implMs = 2000, waitMs = 3000 } = {}) {
+  const base = created ?? '2026-01-01T00:00:00.000Z';
+  const at = (step) => new Date(new Date(base).getTime() + delay * step).toISOString();
+  const verifyingStep = 2;
+  const acceptedStep = verifyingStep + waitMs / delay;
+  const mergedStep = acceptedStep + 1;
+  return {
+    id,
+    title: `任务 ${id}`,
+    status: 'MERGED',
+    implementDurationMs: implMs,
+    history: [
+      { from: null, to: 'CREATED', at: at(0), by: 'auto' },
+      { from: 'CREATED', to: 'PLANNING', at: at(1), by: 'auto' },
+      { from: 'PLANNING', to: 'IMPLEMENTING', at: at(1), by: 'auto' },
+      { from: 'IMPLEMENTING', to: 'VERIFYING', at: at(verifyingStep), by: 'auto' },
+      { from: 'VERIFYING', to: 'ACCEPTED', at: at(acceptedStep), by: 'auto' },
+      { from: 'ACCEPTED', to: 'MERGED', at: at(mergedStep), by: 'auto' },
+    ],
+  };
+}
+
+test('computeMetrics 单任务: TTV/wait_human/impl 正确', () => {
+  const r = computeMetrics([metricTask('t1', { created: '2026-01-01T00:00:00.000Z', delay: 1000, implMs: 5000, waitMs: 3000 })]);
+  const row = r.tasks[0];
+  // created=t0, verifying=t2s, accepted=t5s, merged=t6s
+  assert.equal(row.ttvMs, 6000);
+  assert.equal(row.waitHumanMs, 3000);
+  assert.equal(row.implMs, 5000);
+  assert.deepEqual(row.missing, []);
+  assert.equal(r.summary.complete, 1);
+  assert.equal(r.summary.waitRatio, 3000 / (3000 + 5000));
+  assert.equal(r.summary.bottlenecks[0].id, 't1');
+});
+
+test('computeMetrics 多任务: 平均 TTV、总等待/总实现、等待占比、瓶颈排序', () => {
+  const a = metricTask('a', { created: '2026-01-01T00:00:00.000Z', delay: 1000, implMs: 4000, waitMs: 6000 });
+  const b = metricTask('b', { created: '2026-01-02T00:00:00.000Z', delay: 1000, implMs: 4000, waitMs: 2000 });
+  const r = computeMetrics([a, b]);
+  // a: created0→merged9s ttv=9000, wait=6000; b: created0→merged5s ttv=5000, wait=2000
+  assert.equal(r.summary.complete, 2);
+  assert.equal(r.summary.avgTtvMs, 7000);
+  assert.equal(r.summary.totalImplMs, 8000);
+  assert.equal(r.summary.totalWaitMs, 8000);
+  assert.equal(r.summary.waitRatio, 0.5);
+  assert.deepEqual(
+    r.summary.bottlenecks.map((x) => x.id),
+    ['a', 'b']
+  );
+});
+
+test('computeMetrics 空目录/空列表: 不 crash, total=0', () => {
+  const r = computeMetrics([]);
+  assert.equal(r.tasks.length, 0);
+  assert.equal(r.summary.total, 0);
+  assert.equal(r.summary.complete, 0);
+  assert.equal(r.summary.avgTtvMs, null);
+});
+
+test('computeMetrics 缺 history 任务: 不 crash, 标注缺失且不计入汇总', () => {
+  const good = metricTask('good', { created: '2026-01-01T00:00:00.000Z', delay: 1000, implMs: 1000, waitMs: 1000 });
+  const noHistory = { id: 'bare', title: '无 history', status: 'MERGED', implementDurationMs: 500 };
+  const halfMerged = { ...metricTask('half', { created: '2026-01-01T00:00:00.000Z', delay: 1000 }), status: 'VERIFYING' };
+  halfMerged.history = halfMerged.history.filter((h) => h.to !== 'MERGED' && h.to !== 'ACCEPTED');
+
+  const r = computeMetrics([good, noHistory, halfMerged]);
+  assert.equal(r.tasks.length, 3);
+  assert.ok(r.tasks[1].missing.includes('history'));
+  assert.ok(r.tasks[2].missing.includes('merged'));
+  assert.ok(r.tasks[2].missing.includes('accepted'));
+  assert.equal(r.summary.complete, 1);
+  assert.equal(r.summary.missingCount, 2);
+  assert.equal(r.summary.avgTtvMs, 4000);
+});
+
+test('cmdMetrics --json: 含 tasks[] + summary, 可 JSON.parse', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeTask(dir, metricTask('j1', { created: '2026-01-01T00:00:00.000Z', delay: 1000, implMs: 1000, waitMs: 2000 }));
+  const run = captureOutput(() => cmdMetrics({ cwd: dir, json: true }));
+  const { logs, exitCode } = await run();
+  assert.equal(exitCode, 0);
+  const obj = JSON.parse(logs.join('\n'));
+  assert.equal(obj.type, 'metrics');
+  assert.ok(Array.isArray(obj.result.tasks));
+  assert.ok(obj.result.summary);
+  assert.equal(obj.result.tasks[0].id, 'j1');
+  assert.equal(obj.result.tasks[0].ttvMs, 5000);
+});
+
+test('cmdMetrics 文本: 无任务目录不 crash, 输出 (无任务记录)', async (t) => {
+  const dir = await makeTempDir(t);
+  const run = captureOutput(() => cmdMetrics({ cwd: dir }));
+  const { logs, exitCode } = await run();
+  assert.equal(exitCode, 0);
+  assert.ok(logs.some((l) => l.includes('无任务记录')));
+});
+
+test('main 分发: htask metrics 可达', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeTask(dir, metricTask('m1', { created: '2026-01-01T00:00:00.000Z', delay: 1000, implMs: 1000, waitMs: 2000 }));
+  const run = captureOutput(() => main(['metrics'], { cwd: dir }));
+  const { logs, exitCode } = await run();
+  assert.equal(exitCode, 0);
+  assert.ok(logs.some((l) => l.includes('TTV')));
+  assert.ok(logs.some((l) => l.includes('等待占比')));
 });

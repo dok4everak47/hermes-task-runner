@@ -1,65 +1,77 @@
-# TASK — htask worktree 并行任务隔离
+# TASK — htask 价值声明 + metrics 持续测量
+
+## Value Statement（4 问）
+
+- **谁受益**: 我自己——每个新任务开始前被迫思考价值；每周用 metrics 复盘交付瓶颈
+- **解决什么**: ① 写任务前不验证价值 → 炫技任务混入；② TTV/等待时间不可见 → 决策靠记忆
+- **省多少时间**: 复盘从手动翻 events.jsonl（~30min）→ `htask metrics` 1 秒出报告
+- **改变什么行为**: 写 TASK.md 前先填价值声明（写不出就不开始）；每周一跑 metrics 复盘上周
 
 ## Goal
 
-让每个任务有独立的 git worktree 工作区，互不干扰，支持多任务并行开发。
-Before: 所有任务在同一工作区串行，切换任务要 stash/清工作区。
-After: htask worktree create/list/remove 一键管理独立任务工作区，完成后合回主干。
+让 htask 从"加速交付"升级为"逼你选对问题 + 持续测量交付健康"。
+Before: 任务想写就写，交付效率靠感觉。After: 每个任务强制价值声明，`htask metrics` 一键输出 TTV/等待/瓶颈。
 
 ## Context
 
-- 来源: Hermes_Task_Runner_演进建议.md #8 Git Worktree 并行任务（main + task/auth + task/api 结构）
-- 依赖 git worktree 原生能力: `git worktree add <path> -b <branch>`，每个 worktree 独立 checkout + index
-- 命令分发位置: bin/htask.mjs 1756-1792 行（cmdPlan/cmdStart/.../cmdReport），新增 worktree 命令组
-- 已有 child_process 调用模式可参考 spawnOpenCode / runVerifyCommands
+- 灵感: 范冰《前线部署工程师》第 2 章 PSF（问题-方案契合）+ 附录 A 交付层指标（TTV 价值实现时间）
+- 模板库: ~/Project/.templates/TASK.md（4 项目共用，本任务要改它）
+- htask 命令分发: bin/htask.mjs 1756-1792 行（cmdPlan/cmdStart/.../cmdReport），新增 cmdMetrics
+- 数据源: .htask/tasks/<id>.json 的 history 数组（每任务各阶段时间戳，by=auto/human 区分）+ implementDurationMs
 
 ## Current Behavior
 
-- htask 无 worktree 相关命令（htask --help 列表无 worktree）
-- 所有任务在当前工作目录串行实现，同一时间只有一个任务在跑
+- TASK.md 模板无价值验证环节——任何任务都能直接 htask start
+- TTV/等待时间只在 events.jsonl 里，无汇总命令，复盘靠手工翻
 
 ## Expected Behavior
 
-- `htask worktree create <slug>`: git worktree add .worktrees/<slug> -b task/<slug>，输出 worktree 路径
-- `htask worktree list`: 摘要列出 worktree（path / branch / status）
-- `htask worktree remove <slug>`: 校验后 git worktree remove 清理；脏 worktree 明确报错提示 --force
-- 错误处理: slug 已存在 / 分支已存在 / worktree 不存在 → 明确报错，不破坏现有状态
-- 兼容: 不动现有命令行为；.worktrees/ 加入 .gitignore
+- `htask metrics` 文本输出: 每任务 TTV/实现耗时/等人 accept 耗时 + 汇总（平均 TTV、等待占比、瓶颈分布）
+- `htask metrics --json`: 结构化输出（对齐现有 JSON 风格，id/result 包裹）
+- 模板更新: TASK.md 模板新增 Value Statement 4 问区（Goal 之前）
+- 容错: 无任务目录 / 缺 history 的任务不 crash，标注缺失
 
 ## Design
 
-- 新命令组 worktree，子命令 create / list / remove，入口与现有命令并列
-- 实现用 child_process execFile('git', [...])，stderr 捕获后转友好错误
-- slug 校验: /^[a-z][a-z0-9-]{0,31}$/（对齐 agent 命名规则，拒绝非法输入）
-- create: `git worktree add .worktrees/<slug> -b task/<slug>`（相对仓库根，仓库内建 .worktrees/ 目录）
-- remove: `git worktree remove .worktrees/<slug>`，脏 worktree 时 git 报错 → 提示可用 --force
-- 输出对齐现有 JSON 风格（--json 时 id/type/result 包裹；非 json 简洁文本）
+- 新增 `export async function cmdMetrics({ cwd, json })` + main 分发 case 'metrics' + help 文案
+- 计算逻辑（纯函数 `computeMetrics(tasks)`，可单测）:
+  - 每任务: created/verifying/accepted/merged 时间戳从 history 提取（to=状态 的 at）
+  - TTV = merged - created；wait_human = accepted - verifying；impl = implementDurationMs
+  - 汇总: 平均 TTV、总等待 vs 总实现、等待占比 = wait/(wait+impl)、瓶颈排序
+- 输出: 文本表格（对齐 cmdList 风格）+ --json 全量
+- 模板: TASK.md 模板在 ## Goal 前插入 Value Statement 区（4 问 + 注释"写不出就不要开始"）
 
 ## Files
 
-- bin/htask.mjs: 新增 cmdWorktree（含 create/list/remove 分发）+ main 分发 case 'worktree' + help 文案
-- test/htask.test.mjs: 新增 worktree 测试组（用临时 git 仓库 fixture，参考 makeTempDir 模式）
-- .gitignore: 追加 .worktrees/
+- ~/Project/.templates/TASK.md: 加 Value Statement 区（注意: 此文件在项目模板库，不在仓库内）
+- bin/htask.mjs: cmdMetrics + computeMetrics + 分发 + help
+- test/htask.test.mjs: metrics 测试组（空目录 / 单任务 / 多任务汇总 / 缺 history 容错）
+- TASK.md: 本任务文件（替换）
 
 ## Constraints
 
-- 不引新依赖（child_process 已是内置）
-- 命令输出兼容现有 JSON 风格
-- worktree 路径固定 .worktrees/<slug>（仓库内，可 gitignore，跨机器一致）
-- 不动现有状态机 / 流程命令（start/accept/merge/advance 等）行为
+- 不引新依赖（Date 计算纯 JS）
+- 输出兼容现有 JSON 风格
+- 不动现有命令行为；metrics 只读不写
+- 模板注释用 HTML 注释（<!-- -->），与原模板一致
 
 ## Acceptance Criteria
 
-- htask worktree create/list/remove 三个子命令可用
-- create 后 git worktree list 可见 task/<slug> 分支
-- 单测覆盖: create 成功 / 重复 slug 报错 / remove 成功 / remove 脏 worktree 报错提示
-- 全部测试通过（现有 90 + 新增 5+）
+- `htask metrics` 在 hermes-task-runner 输出真实 7 任务汇总（等待占比约 97%）
+- `htask metrics --json` 可解析，含 tasks[] + summary
+- 单测 4+ 个（空目录/单任务/汇总/容错）
+- 模板文件含 Value Statement 4 问
+- 全部测试通过（现有 100 + 新增）
 
 ## Verification Commands
 
 ```bash
 node --check bin/htask.mjs
 node --test "test/*.test.mjs"
-# 冒烟: 临时仓库里 create → list → remove 一圈
-cd "$(mktemp -d)" && git init -q . && htask worktree create demo && htask worktree list && htask worktree remove demo
+htask metrics
+htask metrics --json | head -40
 ```
+
+## Rollback Plan
+
+- git revert <commit>（metrics 与模板分开提交，模板在独立 commit）

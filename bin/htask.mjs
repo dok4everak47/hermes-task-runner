@@ -1538,6 +1538,136 @@ export async function cmdReport({ cwd }) {
   console.log('📝 REPORT.md 已根据已有状态重新生成');
 }
 
+// ---------- 命令: metrics ----------
+
+// 从任务 history 提取首次到达某状态的 at 时间戳 (to=状态 的 at)
+function historyAt(task, status) {
+  const history = Array.isArray(task?.history) ? task.history : [];
+  for (const h of history) {
+    if (h && h.to === status && h.at) return h.at;
+  }
+  return null;
+}
+
+// 纯函数: 每任务 TTV/实现耗时/等人 accept 耗时 + 汇总 (平均 TTV、等待占比、瓶颈排序)
+//  - TTV = merged - created；wait_human = accepted - verifying；impl = implementDurationMs
+//  - 缺 history / 缺阶段时间戳的任务不 crash, 标 missing, 不参与汇总
+export function computeMetrics(tasks) {
+  const rows = (Array.isArray(tasks) ? tasks : []).map((task) => {
+    const hasHistory = Array.isArray(task?.history) && task.history.length > 0;
+    const created = hasHistory ? historyAt(task, 'CREATED') : null;
+    const verifying = hasHistory ? historyAt(task, 'VERIFYING') : null;
+    const accepted = hasHistory ? historyAt(task, 'ACCEPTED') : null;
+    const merged = hasHistory ? historyAt(task, 'MERGED') : null;
+
+    const diffMs = (a, b) => {
+      if (!a || !b) return null;
+      const ta = new Date(a).getTime();
+      const tb = new Date(b).getTime();
+      if (!Number.isFinite(ta) || !Number.isFinite(tb)) return null;
+      return Math.max(0, tb - ta);
+    };
+
+    const ttv = diffMs(created, merged);
+    const waitHuman = diffMs(verifying, accepted);
+    const impl = typeof task.implementDurationMs === 'number' && Number.isFinite(task.implementDurationMs) ? task.implementDurationMs : null;
+
+    const missing = [];
+    if (!hasHistory) missing.push('history');
+    if (!merged) missing.push('merged');
+    if (!accepted) missing.push('accepted');
+    if (ttv === null) missing.push('ttv');
+    if (waitHuman === null) missing.push('wait_human');
+    if (impl === null) missing.push('impl');
+
+    return {
+      id: task.id,
+      title: task.title ?? '-',
+      status: task.status ?? '-',
+      created,
+      verifying,
+      accepted,
+      merged,
+      ttvMs: ttv,
+      implMs: impl,
+      waitHumanMs: waitHuman,
+      missing,
+    };
+  });
+
+  // 汇总只统计 TTV/等待/实现齐全的任务, 缺失任务计入 missingCount
+  const complete = rows.filter((r) => r.ttvMs !== null && r.waitHumanMs !== null && r.implMs !== null);
+  const avg = (arr) => (arr.length === 0 ? null : arr.reduce((a, b) => a + b, 0) / arr.length);
+  const sum = (arr) => arr.reduce((a, b) => a + b, 0);
+  const totalWait = sum(complete.map((r) => r.waitHumanMs));
+  const totalImpl = sum(complete.map((r) => r.implMs));
+  const waitRatio = totalWait + totalImpl > 0 ? totalWait / (totalWait + totalImpl) : null;
+  const bottlenecks = complete
+    .slice()
+    .sort((a, b) => b.waitHumanMs - a.waitHumanMs)
+    .map((r) => ({ id: r.id, waitHumanMs: r.waitHumanMs }));
+
+  return {
+    tasks: rows,
+    summary: {
+      total: rows.length,
+      complete: complete.length,
+      missingCount: rows.length - complete.length,
+      avgTtvMs: avg(complete.map((r) => r.ttvMs)),
+      totalWaitMs: totalWait,
+      totalImplMs: totalImpl,
+      waitRatio,
+      bottlenecks: bottlenecks.slice(0, 3),
+    },
+  };
+}
+
+export async function cmdMetrics({ cwd, json }) {
+  const tasks = await readAllTasks(cwd);
+  const { tasks: rows, summary } = computeMetrics(tasks);
+
+  if (json) {
+    console.log(JSON.stringify({ id: 'metrics', type: 'metrics', result: { tasks: rows, summary } }, null, 2));
+    return;
+  }
+
+  if (rows.length === 0) {
+    console.log('(无任务记录, 无法生成 metrics)');
+    return;
+  }
+
+  const fmt = (ms) => (typeof ms === 'number' && Number.isFinite(ms) ? fmtDuration(ms) : '-');
+  const pad = (s, n) => {
+    s = String(s ?? '');
+    return s.length >= n ? s : s + ' '.repeat(n - s.length);
+  };
+  const mark = (r) => (r.missing.length === 0 ? '' : ` ⚠️缺${r.missing.join('/')}`);
+
+  const w = {
+    id: Math.max(2, ...rows.map((r) => String(r.id).length)),
+    ttv: Math.max(3, ...rows.map((r) => fmt(r.ttvMs).length)),
+    impl: Math.max(6, ...rows.map((r) => fmt(r.implMs).length)),
+    wait: Math.max(10, ...rows.map((r) => fmt(r.waitHumanMs).length)),
+    status: Math.max(4, ...rows.map((r) => String(r.status).length)),
+  };
+  console.log(`${pad('ID', w.id)}  ${pad('TTV', w.ttv)}  ${pad('实现', w.impl)}  ${pad('等人 accept', w.wait)}  ${pad('状态', w.status)}  备注`);
+  for (const r of rows) {
+    console.log(`${pad(r.id, w.id)}  ${pad(fmt(r.ttvMs), w.ttv)}  ${pad(fmt(r.implMs), w.impl)}  ${pad(fmt(r.waitHumanMs), w.wait)}  ${pad(r.status, w.status)}  ${mark(r)}`);
+  }
+
+  const s = summary;
+  console.log('');
+  console.log(
+    `汇总: ${s.complete}/${s.total} 任务完整 · 平均 TTV ${fmt(s.avgTtvMs)} · 总等待 ${fmt(s.totalWaitMs)} vs 总实现 ${fmt(s.totalImplMs)} · 等待占比 ${s.waitRatio !== null ? `${(s.waitRatio * 100).toFixed(1)}%` : '-'}`
+  );
+  if (s.bottlenecks.length > 0) {
+    console.log(`瓶颈: ${s.bottlenecks.map((b) => `${b.id} (${fmt(b.waitHumanMs)})`).join(' > ')}`);
+  }
+  if (s.missingCount > 0) {
+    console.log(`⚠️ ${s.missingCount} 个任务缺 TTV/等待/实现数据, 未计入汇总`);
+  }
+}
+
 // ---------- Human Approval Policy ----------
 
 // .htask/approval.yaml (可选, 零依赖 YAML 子集解析): rules.high_risk / rules.low_risk。
@@ -1909,6 +2039,7 @@ function printHelp() {
   htask policy
   htask events [--tail N]
   htask report
+  htask metrics [--json]           每任务 TTV/实现耗时/等人 accept 耗时 + 汇总 (平均 TTV、等待占比、瓶颈)
   htask worktree create <slug>   创建独立工作区 .worktrees/<slug> (分支 task/<slug>)
   htask worktree list [--json]   列出 worktree (path / branch / status)
   htask worktree remove <slug> [--force]
@@ -1925,7 +2056,7 @@ function printHelp() {
   --no-push                  merge/advance 时跳过 git push
   --fix                      retry 时用 agent 自动修复重实现
   --yes                      retry --fix 跳过确认
-  --json                     plan/status/list/advance 输出 JSON (可 JSON.parse)
+  --json                     plan/status/list/advance/metrics 输出 JSON (可 JSON.parse)
   --tail N                   events 查看最近 N 条 (默认 10)
   advance                    自动推进可自动的迁移: VERIFYING(全过)→ACCEPTED→MERGED
 
@@ -2000,6 +2131,9 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
       break;
     case 'report':
       await cmdReport({ cwd });
+      break;
+    case 'metrics':
+      await cmdMetrics({ cwd, json: opts.json });
       break;
     case 'worktree':
       await cmdWorktree({ cwd, args: rest, json: opts.json });
