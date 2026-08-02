@@ -1,66 +1,91 @@
-# TASK — README 补充可观测性文档
+# TASK — Dynamic Pipeline：按 plan.pipeline 动态驱动执行序列
 
 ## Value Statement
 
-- **谁受益**: 用 htask 的人（含未来的你）——新能力（progress.json/细粒度事件/通知）没文档等于不存在
-- **解决什么**: README 还停留在旧功能列表，progress.json/事件/通知节点无说明
-- **省多少时间**: 未来查"怎么看任务进度"不用翻代码
-- **改变什么行为**: 新能力可被发现、被使用
+- **谁受益**: 你——任务按类型走对的流程（bug 修复不浪费 reviewer、架构任务有 architect 前置），少花 token 少等时间
+- **解决什么**: plan.pipeline 只记录不执行，所有任务走同一固定流程（developer→reviewer→tester），小任务也被 review 拖慢
+- **省多少时间**: 无 reviewer 的任务省一次 agent 调用（数分钟 + token）
+- **改变什么行为**: 任务流程从"一刀切"变为"按 planner 分析结果定制"
 
 ## Goal
 
-README.md 补充可观测性章节，覆盖 progress.json / verify 粒度事件 / 通知节点。
-Before: README 无 progress/事件说明。After: 读者知道怎么实时查任务状态。
+让 htask 按 plan.pipeline 真正驱动执行序列（对齐演进建议 #2 Dynamic Pipeline）。
+Before: pipeline 只是 JSON 里的记录。After: pipeline 元素决定实际执行的 agent 阶段。
 
 ## Context
 
-- 可观测性功能已实现（commit 7ae9b7b）:
-  - .htask/progress.json: {taskId,status,stage,progress,currentAction,startedAt,updatedAt}
-  - stage 映射: PLANNING→planning / IMPLEMENTING→coding / REVIEWING→reviewing / VERIFYING→testing / MERGED→finished / FAILED→failed / idle(无任务)
-  - progress: CREATED 5 / PLANNING 15 / IMPLEMENTING 40 / REVIEWING 60 / VERIFYING 80 / ACCEPTED 90 / MERGED 100 / FAILED 0
-  - events.jsonl 新增: test_started / test_passed / test_failed（detail 含命令）
-  - 通知节点: 🔨开始 / 🧪测试中 / ✅完成 / ❌失败（HTASK_NOTIFY=0 全关）
-- README.md 在仓库根，现有结构: 功能列表 + 用法 + 状态机说明
+- 演进建议 Hermes_Task_Runner_演进建议.md #2:
+  - Bug 修复: Developer → Test → Verify（无 reviewer）
+  - 架构修改: Architect → Developer → Reviewer → Security Review → Verify
+  - 文档任务: Writer → Proofread
+- 现状: cmdStart（bin/htask.mjs L880+）固定流程（spawn developer 实现 → [可选 reviewer] → verify）；plan.pipeline 在 L946 打印、L1863 推荐，不驱动
+- plan 结构: { complexity, risk[], pipeline[], suggestModel, suggestReview }
+- pipeline 元素（planner 生成）: architect / developer / schema-check / security-reviewer / reviewer / tester / writer / proofread
+- reviewer agent: ~/.config/opencode/agents/reviewer.md（htask --review 时用）
 
 ## Current Behavior
 
-- README 无 progress.json / 细粒度事件 / 通知节点说明
+- 所有任务: spawn developer（实现）→ 验证（verify 命令）→ [--review 时跑 reviewer]
+- plan.pipeline 不参与执行决策
 
 ## Expected Behavior
 
-- README 新增「可观测性」章节:
-  - progress.json 路径 + 字段说明 + stage/progress 映射表
-  - 事件类型列表（含 verify 粒度）
-  - 通知节点 + HTASK_NOTIFY 开关
-  - 消费示例: `cat .htask/progress.json` / `tail .htask/events.jsonl`
-- 不破坏现有章节结构（追加或插入合适位置）
+- cmdStart 按 plan.pipeline 决定执行序列（无 plan 的旧任务保持现状向后兼容）:
+  - pipeline 含 `architect` → developer 前跑一次架构分析 prompt（普通 opencode run，不指定 agent 角色）
+  - pipeline 含 `reviewer` → 现有 reviewer 流程（等价 --review）
+  - pipeline 含 `security-reviewer` → verify 前跑安全检查 prompt
+  - pipeline **不含** `reviewer` 且未显式 --review → 跳过 reviewer（省 token）——但 review 字段记为 skipped
+  - `developer`/`tester` 元素不新增行为（developer=现有实现，tester=现有 verify）
+- 执行顺序: architect → developer → [security-reviewer] → verify → [reviewer 若在 pipeline 尾部?] —— 按文档: 架构=Architect→Developer→Reviewer→Security→Verify；bug=Developer→Verify
+- 具体顺序映射（pipeline 元素 → 执行位置）:
+  - architect: 实现前（前置 prompt）
+  - developer: 实现（现有）
+  - reviewer: verify 后（现有 reviewer 逻辑）
+  - security-reviewer: verify 前（安全检查 prompt）
+  - schema-check: verify 前（只跑 plan 检查类 prompt, 不阻塞）
+- 每个新阶段: spawn opencode run（复用 runAgent/适配器），输出追加到 .htask/logs/<task-id>.log，失败不中断主流程（记 warn），阶段结果写进 task JSON（`stages: [{name, exitCode, durationMs, output}]`）
+- 跳过 reviewer 时 task.review = { status: "skipped", reason: "pipeline" }
 
 ## Design
 
-- 在 README 状态机说明之后追加「## 可观测性」章节
-- 用表格列 stage 映射和事件类型
-- 保持 README 简洁风格（不堆细节）
+- cmdStart 重构: 把"实现 → 验证 → 审查"改为 pipeline 驱动的阶段循环
+  - `const stages = buildStages(plan)` → [{name:'architect', before:'implement'}, {name:'developer'}, ...]
+  - 现有代码路径保留（无 plan 任务走旧逻辑）
+- 新增 `function buildStages(plan)`: plan.pipeline → 有序阶段列表（含位置标记）
+- 新增 `function runPipelineStage(cwd, backend, stage, prompt, logName)`: 复用 runAgent（architect/security-reviewer 用普通 prompt，不传 --agent；reviewer 用现有逻辑）
+- task JSON 加 `stages` 数组（记录每阶段 exitCode/durationMs/output 摘要）
+- htask status/list 展示 stages 摘要（可选，一行）
 
 ## Files
 
-- README.md（追加章节）
+- bin/htask.mjs: buildStages + runPipelineStage + cmdStart 重构 + task.stages 字段
+- test/htask.test.mjs: pipeline 测试（含 reviewer 跳过/architect 前置/无 plan 兼容）
 
 ## Constraints
 
-- 只改 README.md，不动代码
-- 中文文档（README 现有风格）
+- 无 plan 任务 / 旧任务行为完全不变（向后兼容）
+- 新阶段失败不阻塞主流程（warn + 记录）
+- reviewer 显式 --review 始终优先于 pipeline（用户显式要求时）
+- 不引新依赖
+- token 控制: 每新增阶段是独立 prompt，保持 prompt 简短（一两句指令）
 
 ## Acceptance Criteria
 
-- README 含可观测性章节 + progress.json 字段 + stage 映射表 + 事件列表
-- 无代码改动
+- pipeline 含 reviewer → 跑 reviewer；不含 → 跳过且 review=skipped
+- pipeline 含 architect → 实现前有 architect 阶段记录
+- 阶段结果写入 task.stages（name/exitCode/durationMs）
+- 无 plan 任务流程不变
+- 单测 ≥ 6（跳过/前置/顺序/兼容/失败不阻塞/显式 --review 优先）
+- 全部测试通过（119 + 新增）+ 冒烟
 
 ## Verification Commands
 
 ```bash
-grep -c "可观测性\|progress.json" README.md
+node --check bin/htask.mjs
+node --test "test/*.test.mjs"
+# 冒烟: 构造 plan 不含 reviewer 的任务 → 验证跳过
 ```
 
 ## Rollback Plan
 
-- git revert <commit>（README 单文件）
+- git revert <commit>

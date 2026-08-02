@@ -61,6 +61,9 @@ import {
   stageFor,
   progressFor,
   writeProgress,
+  buildStages,
+  runPipelineStage,
+  stagePrompt,
 } from '../bin/htask.mjs';
 
 async function makeTempDir(t) {
@@ -1626,7 +1629,7 @@ test('taskToJson/listToJson 含 artifactDir 字段', async (t) => {
 
 // ---------- cmdStart 集成 Planner ----------
 
-test('cmdStart 高复杂度任务: plan 写入 state, artifacts 齐全, 事件齐全, 默认开 review', async (t) => {
+test('cmdStart 高复杂度任务: plan 写入 state, artifacts 齐全, 事件齐全, pipeline 跳过 reviewer', async (t) => {
   const dir = await makeTempDir(t);
   const task = path.join(dir, 'TASK.md');
   await writeFile(
@@ -1650,7 +1653,17 @@ node -e "console.log('ok')"
     const tsk = await taskById(dir, id);
     assert.equal(tsk.plan.complexity, 'high');
     assert.ok(tsk.plan.pipeline.includes('security-reviewer'));
-    assert.ok(tsk.history.map((h) => h.to).includes('REVIEWING')); // suggestReview → 默认开 review
+    assert.ok(tsk.plan.pipeline.includes('architect'));
+    assert.ok(!tsk.plan.pipeline.includes('reviewer'));
+    // pipeline 不含 reviewer → 跳过 review, 记为 skipped
+    assert.ok(!tsk.history.map((h) => h.to).includes('REVIEWING'));
+    assert.equal(tsk.review.status, 'skipped');
+    assert.equal(tsk.review.reason, 'pipeline');
+    // 阶段按 pipeline 顺序记录: architect(前置) → developer → schema-check/security-reviewer → tester
+    assert.deepEqual(
+      tsk.stages.map((s) => s.name),
+      ['architect', 'developer', 'schema-check', 'security-reviewer', 'tester']
+    );
 
     const art = path.join(dir, '.htask', 'artifacts', id);
     assert.ok(existsSync(path.join(art, 'TASK.md')));
@@ -1697,6 +1710,173 @@ test('cmdStart 低复杂度任务: suggestReview=false 默认不开 review', asy
     assert.equal(tsk.plan.complexity, 'low');
     assert.ok(!tsk.history.map((h) => h.to).includes('REVIEWING'));
   });
+});
+
+// ---------- Dynamic Pipeline (buildStages / runPipelineStage / cmdStart 驱动) ----------
+
+test('buildStages: pipeline → 有序阶段 + 位置标记; 无 plan → []; 去重 + 未知元素兜底', () => {
+  const plan = { pipeline: ['architect', 'developer', 'security-reviewer', 'schema-check', 'reviewer', 'tester'] };
+  assert.deepEqual(buildStages(plan), [
+    { name: 'architect', pos: 'before-implement' },
+    { name: 'developer', pos: 'implement' },
+    { name: 'security-reviewer', pos: 'before-verify' },
+    { name: 'schema-check', pos: 'before-verify' },
+    { name: 'reviewer', pos: 'review' },
+    { name: 'tester', pos: 'verify' },
+  ]);
+  assert.deepEqual(buildStages(null), []);
+  assert.deepEqual(buildStages(undefined), []);
+  assert.deepEqual(buildStages({}), []);
+  // 去重 + 未知元素兜底 implement
+  assert.deepEqual(buildStages({ pipeline: ['developer', 'developer', 'bogus'] }), [
+    { name: 'developer', pos: 'implement' },
+    { name: 'bogus', pos: 'implement' },
+  ]);
+});
+
+test('stagePrompt: 每个阶段独立短 prompt (token 控制), 不指定 agent 角色', () => {
+  assert.ok(stagePrompt('architect', 'TASK.md').includes('架构前置分析'));
+  assert.ok(stagePrompt('security-reviewer', 'TASK.md').includes('安全检查'));
+  assert.ok(stagePrompt('schema-check', 'TASK.md').includes('schema'));
+  assert.ok(stagePrompt('unknown', 'TASK.md').includes('unknown'));
+});
+
+test('runPipelineStage: 复用 runAgent, 记录 name/exitCode/durationMs/output, 失败不抛错', async (t) => {
+  const dir = await makeTempDir(t);
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const r = await runPipelineStage(dir, 'opencode', { name: 'architect' }, stagePrompt('architect', 'TASK.md'), 'pipeline.log', 'm');
+    assert.equal(r.name, 'architect');
+    assert.equal(r.exitCode, 0);
+    assert.equal(typeof r.durationMs, 'number');
+    assert.ok(r.output.includes('fake implemented ok'));
+  });
+  // 输出追加到 .htask/<logName>
+  assert.ok((await readFile(path.join(dir, '.htask', 'pipeline.log'), 'utf8')).includes('fake implemented ok'));
+});
+
+test('pipeline 不含 reviewer → 跳过 review, review=skipped', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 简单任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md') });
+    assert.equal(res.ok, true);
+  });
+  const tsk = await taskById(dir, await currentId(dir));
+  assert.equal(tsk.review.status, 'skipped');
+  assert.equal(tsk.review.reason, 'pipeline');
+  assert.ok(!tsk.history.map((h) => h.to).includes('REVIEWING'));
+  assert.ok(!tsk.stages.some((s) => s.name === 'reviewer'));
+});
+
+test('pipeline 含 architect → 实现前跑架构阶段, 记录在 developer 前', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 架构重构\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md') });
+    assert.equal(res.ok, true);
+  });
+  const tsk = await taskById(dir, await currentId(dir));
+  assert.equal(tsk.stages[0].name, 'architect');
+  assert.equal(tsk.stages[0].exitCode, 0);
+  assert.equal(typeof tsk.stages[0].durationMs, 'number');
+  assert.equal(tsk.stages[1].name, 'developer');
+  // fake.log: architect prompt 先于 developer prompt
+  const fake = await readFile(path.join(dir, 'fake.log'), 'utf8');
+  const lines = fake.trim().split('\n').filter(Boolean);
+  const ai = lines.findIndex((l) => l.includes('架构前置分析'));
+  const di = lines.findIndex((l) => l.includes('按 TASK.md 实现'));
+  assert.ok(ai !== -1 && di !== -1, `应找到 architect 与 developer 调用, 实际: ${lines.join(' | ')}`);
+  assert.ok(ai < di, 'architect 应在 developer 之前');
+});
+
+test('pipeline 顺序: architect → developer → security-reviewer → tester (verify)', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 安全认证系统\n\n涉及 oauth 认证 权限控制 安全\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md') });
+    assert.equal(res.ok, true);
+  });
+  const tsk = await taskById(dir, await currentId(dir));
+  assert.deepEqual(tsk.stages.map((s) => s.name), ['architect', 'developer', 'security-reviewer', 'tester']);
+  const idx = (name) => tsk.stages.findIndex((s) => s.name === name);
+  assert.ok(idx('architect') < idx('developer'), 'architect 在 developer 前');
+  assert.ok(idx('security-reviewer') < idx('tester'), 'security-reviewer 在 verify 前');
+});
+
+test('兼容: 无 plan/旧任务无 stages 字段 → taskToJson/status 不 crash, stages=[]', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: '旧任务' });
+  delete task.stages; // 模拟旧格式任务 (无 stages 字段)
+  await writeTask(dir, task);
+  const j = taskToJson(task);
+  assert.deepEqual(j.stages, []);
+  assert.deepEqual(buildStages(null), []); // 无 plan 不 crash
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdStatus({ cwd: dir });
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(logs.some((l) => l.includes('状态: CREATED')));
+});
+
+test('pipeline 阶段失败不阻塞主流程: security-reviewer 失败仍到 VERIFYING, 记录 exitCode', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 安全功能\n\n涉及 oauth 认证 权限\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  // 假 opencode: 安全检查 prompt 退出 1, 其余成功
+  const script = path.join(dir, 'fail-sec-opencode.sh');
+  await writeFile(
+    script,
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> "$(dirname "$0")/fake.log"\nprintf 'fake output\\n'\ncase "$*" in\n  *安全检查*) exit 1 ;;\n  *) exit 0 ;;\nesac\n`
+  );
+  await chmod(script, 0o755);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md') });
+    assert.equal(res.ok, true);
+  });
+  const tsk = await taskById(dir, await currentId(dir));
+  assert.equal(tsk.status, 'VERIFYING'); // 阶段失败不中断主流程
+  const sec = tsk.stages.find((s) => s.name === 'security-reviewer');
+  assert.equal(sec.exitCode, 1);
+  assert.equal(typeof sec.durationMs, 'number');
+  // 后续阶段照常执行
+  assert.equal(tsk.stages[tsk.stages.length - 1].name, 'tester');
+  assert.equal(tsk.stages[tsk.stages.length - 1].exitCode, 0);
+});
+
+test('显式 --review 优先于 pipeline: pipeline 无 reviewer 时也跑 review', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 简单任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md'), review: true });
+    assert.equal(res.ok, true);
+  });
+  const tsk = await taskById(dir, await currentId(dir));
+  assert.equal(tsk.review, 'passed'); // 显式 --review 不落 skipped
+  assert.ok(tsk.history.map((h) => h.to).includes('REVIEWING'));
+  assert.ok(tsk.stages.some((s) => s.name === 'reviewer'));
 });
 
 // ---------- Agent Adapter Layer ----------

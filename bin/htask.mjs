@@ -385,6 +385,7 @@ export async function createTask(cwd, meta) {
     implementExit: null,
     implementDurationMs: null,
     verify: [],
+    stages: [],
   };
   await writeTask(cwd, task);
   await writeState(cwd, { currentId: id });
@@ -768,6 +769,73 @@ export async function runAgent(cwd, backend, { model, agent } = {}, prompt, logN
   return spawnAgentCmd(cwd, adapter.runCmd[0], fullArgs, logName, adapter.env);
 }
 
+// ---------- Dynamic Pipeline (buildStages / runPipelineStage) ----------
+
+// pipeline 元素 → 执行位置:
+//   architect: 实现前 (before-implement, 前置 prompt)
+//   developer: 实现 (implement, 现有行为)
+//   security-reviewer / schema-check: 验证前 (before-verify, 检查类 prompt, 失败不阻塞)
+//   reviewer: 审查 (review, 现有 reviewer 流程)
+//   tester: 验证 (verify, 现有行为, 不新增)
+const STAGE_POSITION = {
+  architect: 'before-implement',
+  developer: 'implement',
+  'security-reviewer': 'before-verify',
+  'schema-check': 'before-verify',
+  reviewer: 'review',
+  tester: 'verify',
+};
+
+// plan.pipeline → 有序阶段列表 (含位置标记); 无 plan / 无 pipeline → [] (向后兼容)
+export function buildStages(plan) {
+  if (!plan || !Array.isArray(plan.pipeline)) return [];
+  const seen = new Set();
+  const stages = [];
+  for (const name of plan.pipeline) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    stages.push({ name, pos: STAGE_POSITION[name] ?? 'implement' });
+  }
+  return stages;
+}
+
+// 每新增阶段是独立 prompt, 保持简短 (token 控制)
+export function stagePrompt(name, taskFile) {
+  switch (name) {
+    case 'architect':
+      return `按 ${taskFile} 做架构前置分析: 识别关键设计约束、模块划分与实现路径, 简短输出。`;
+    case 'security-reviewer':
+      return `对 ${taskFile} 的当前实现做安全检查: 识别安全风险点, 简短列出。`;
+    case 'schema-check':
+      return `检查 ${taskFile} 实现的 schema/迁移一致性, 简短列出问题。`;
+    default:
+      return `按 ${taskFile} 执行阶段 ${name}, 简短输出。`;
+  }
+}
+
+// 读日志尾部作为阶段输出摘要 (截断 OUTPUT_LIMIT)
+function readStageOutput(cwd, logName) {
+  try {
+    const raw = readFileSync(path.join(cwd, '.htask', logName), 'utf8');
+    if (raw.length <= OUTPUT_LIMIT) return raw.trim();
+    return raw.slice(-OUTPUT_LIMIT) + '\n…[输出截断]';
+  } catch {
+    return '';
+  }
+}
+
+// 跑一个 pipeline 阶段: 复用 runAgent, 普通 prompt 不指定 agent 角色
+// (architect/security-reviewer/schema-check), 输出追加到 .htask/<logName>
+export async function runPipelineStage(cwd, backend, stage, prompt, logName, model) {
+  const r = await runAgent(cwd, backend, { model, agent: null }, prompt, logName);
+  return {
+    name: stage?.name ?? 'stage',
+    exitCode: r.exitCode,
+    durationMs: r.durationMs,
+    output: readStageOutput(cwd, logName),
+  };
+}
+
 // ---------- 验证 ----------
 
 // 逐条执行验证命令, 超时 600s/条, 记录 exit code / 耗时 / 输出 (截断 2000 字符)。
@@ -941,7 +1009,9 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     } catch (err) {
       console.warn(`⚠️ 写入 artifacts 失败: ${err.message}`);
     }
-    const useReview = !!review || (!!plan?.suggestReview && !noReview);
+    // pipeline 驱动: reviewer 元素决定是否跑 review (显式 --review 始终优先; --no-review 关闭)
+    const stagesDef = buildStages(plan);
+    const useReview = !!review || (stagesDef.some((s) => s.name === 'reviewer') && !noReview);
     if (plan) {
       console.log(`📋 计划: complexity=${plan.complexity}, risk=[${plan.risk.join(', ')}], pipeline=[${plan.pipeline.join(', ')}]`);
     }
@@ -965,6 +1035,29 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     const logName = `logs/${task.id}.log`;
     // 开始通知即时弹 (不受成功<10s 噪音过滤约束)
     notify('🔨 OpenCode 开始执行任务', task.title);
+
+    // pipeline 阶段记录 (task.stages): 失败不阻塞主流程 (warn + 记录)
+    const stages = [];
+    const runStage = async (name, prompt) => {
+      const stage = await runPipelineStage(cwd, backend.backend, { name }, prompt, logName, model ?? task.model);
+      stages.push(stage);
+      task = await readTask(cwd, task.id);
+      task.stages = [...stages];
+      task.updatedAt = new Date().toISOString();
+      await writeTask(cwd, task);
+      if (stage.exitCode !== 0) {
+        console.warn(`⚠️ 阶段 ${name} 退出码 ${stage.exitCode}, 已记录, 继续主流程 (日志: .htask/${logName})`);
+      } else {
+        console.log(`📦 阶段 ${name} 完成 (${fmtDuration(stage.durationMs)})`);
+      }
+      return stage;
+    };
+
+    // architect: 实现前跑架构分析 prompt (普通 opencode run, 不指定 agent 角色)
+    for (const s of stagesDef.filter((st) => st.pos === 'before-implement')) {
+      await runStage(s.name, stagePrompt(s.name, path.basename(taskFile)));
+    }
+
     const implement = await runAgent(
       cwd,
       backend.backend,
@@ -976,6 +1069,13 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     task.implementExit = implement.exitCode;
     task.implementDurationMs = implement.durationMs;
     task.updatedAt = new Date().toISOString();
+    stages.push({
+      name: 'developer',
+      exitCode: implement.exitCode,
+      durationMs: implement.durationMs,
+      output: readStageOutput(cwd, logName),
+    });
+    task.stages = [...stages];
     await writeTask(cwd, task);
 
     // 噪音过滤: 成功但极短耗时 (<10s) 说明 agent 没真正干活, 不弹;
@@ -994,7 +1094,12 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
       return { ok: false, reason: 'implement-failed' };
     }
 
-    // 4. --review → REVIEWING → reviewer → 记录 review 结果 → VERIFYING
+    // security-reviewer / schema-check: verify 前跑检查 prompt, 失败不阻塞主流程
+    for (const s of stagesDef.filter((st) => st.pos === 'before-verify')) {
+      await runStage(s.name, stagePrompt(s.name, path.basename(taskFile)));
+    }
+
+    // 4. --review / pipeline 含 reviewer → REVIEWING → reviewer → 记录 review 结果 → VERIFYING
     if (useReview) {
       await transition(cwd, task.id, 'REVIEWING', 'auto');
       console.log('🧐 运行 reviewer agent...');
@@ -1008,6 +1113,14 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
       );
       task = await readTask(cwd, task.id);
       task.review = rev.exitCode === 0 ? 'passed' : 'failed';
+      task.updatedAt = new Date().toISOString();
+      stages.push({
+        name: 'reviewer',
+        exitCode: rev.exitCode,
+        durationMs: rev.durationMs,
+        output: readStageOutput(cwd, revLog),
+      });
+      task.stages = [...stages];
       await writeTask(cwd, task);
       if (rev.exitCode !== 0) {
         console.warn(`⚠️ reviewer 退出码 ${rev.exitCode}, 详见 .htask/${revLog}`);
@@ -1022,6 +1135,12 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
       } catch (err) {
         console.warn(`⚠️ 复制 REVIEW.md 到 artifacts 失败: ${err.message}`);
       }
+    } else if (plan) {
+      // pipeline 不含 reviewer 且未显式 --review → 跳过 review (省 token), 记为 skipped
+      task = await readTask(cwd, task.id);
+      task.review = { status: 'skipped', reason: 'pipeline' };
+      task.updatedAt = new Date().toISOString();
+      await writeTask(cwd, task);
     }
     await transition(cwd, task.id, 'VERIFYING', 'auto');
     emitEvent(cwd, { type: 'task.verifying', taskId: task.id });
@@ -1038,9 +1157,15 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     task.verify = verify;
     task.verification = verificationSummary(verify);
     task.updatedAt = new Date().toISOString();
-    await writeTask(cwd, task);
-
     const allPass = verify.every((r) => r.exitCode === 0);
+    stages.push({
+      name: 'tester',
+      exitCode: allPass ? 0 : 1,
+      durationMs: verify.reduce((s, r) => s + (r.durationMs ?? 0), 0),
+      output: verify.map((r) => `${r.command} → exit ${r.exitCode}`).join('\n'),
+    });
+    task.stages = [...stages];
+    await writeTask(cwd, task);
     if (allPass) {
       console.log('✅ 验证全过, 下一步: htask accept');
       emitEvent(cwd, { type: 'task.waiting_human', taskId: task.id, reason: 'accept' });
@@ -1474,6 +1599,7 @@ export function taskToJson(task) {
     review: task.review ?? null,
     verification: task.verification ?? verificationSummary(task.verify ?? []),
     verify: (task.verify ?? []).map((r) => ({ command: r.command, exitCode: r.exitCode })),
+    stages: (task.stages ?? []).map((s) => ({ name: s.name, exitCode: s.exitCode, durationMs: s.durationMs })),
     historyCount: (task.history ?? []).length,
     startedAt: task.startedAt,
     updatedAt: task.updatedAt,
@@ -1526,7 +1652,13 @@ function printTaskDetail(task) {
     const pass = task.verify.filter((r) => r.exitCode === 0).length;
     console.log(`验证: ${task.verify.length} 条, 通过 ${pass}`);
   }
-  if (task.review) console.log(`review: ${task.review}`);
+  if (task.review) {
+    const rv = task.review;
+    console.log(`review: ${typeof rv === 'string' ? rv : `${rv.status}${rv.reason ? ` (${rv.reason})` : ''}`}`);
+  }
+  if (Array.isArray(task.stages) && task.stages.length > 0) {
+    console.log(`阶段: ${task.stages.map((s) => `${s.name}${s.exitCode === 0 ? '✅' : '❌'}`).join(' → ')}`);
+  }
   console.log(`下一步: ${nextStep(task)}`);
   console.log('迁移历史:');
   (task.history ?? []).forEach((h, i) => {
