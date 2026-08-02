@@ -49,20 +49,70 @@ CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED �
 内置报告保护: `merge` / `advance` 提交时自动把 `REPORT.md` / `REVIEW.md` 从暂存区排除
 (`git add -A` 后 reset), 不依赖项目 `.gitignore` 配置; 报告文件保留在工作区, 只不进 commit。
 
-每个任务一个文件 `.htask/tasks/<id>.json`, 含 status / history (迁移历史) / verify 结果等;
+每个任务一个文件 `.htask/tasks/<id>.json`, 含 status / history (迁移历史) / verify 结果 / plan 等;
 `.htask/state.json` 只是当前任务指针 `{ currentId }`。旧格式 state.json (含 status)
 首次读取时自动迁移到 `tasks/task-<日期>-legacy.json`。
+
+## Task Planner (`htask plan`)
+
+`htask plan [TASK.md] [--json]` 用纯规则 (零依赖, 不用 LLM) 分析任务并输出建议:
+
+- `complexity`: high (含 架构|重构|迁移|安全|认证|oauth|数据库|schema 或 >3000 字) / medium (含 功能|接口|api|测试|工具 或 1000-3000 字) / low。
+- `risk`: security / database / api / dependency 关键字命中集合。
+- `pipeline`: 按复杂度生成, risk 含 security → 插入 `security-reviewer`, 含 database → 插入 `schema-check`。
+- `suggestReview`: complexity != low 或 risk 非空 → 建议 review。
+- `estimated`: 预计改动文件数 / 分钟数。
+
+`htask start` 启动时自动调 Planner, 把结果写入 `state.plan`, 打印一行
+`📋 计划: complexity=…, risk=[…], pipeline=[…]`; 且 `suggestReview` 为 true 时默认开 review
+(`--no-review` 关闭)。`htask plan --json` 输出纯 JSON。
+
+## Event System (`htask events`)
+
+状态迁移与关键动作发事件, 追加到 `.htask/events.jsonl` (JSON Lines):
+
+```
+task.created      {taskId, title}
+task.started      {taskId, status: "IMPLEMENTING"}
+task.review_failed {taskId}
+task.verifying    {taskId}
+task.waiting_human {taskId, reason: "accept" | "merge"}
+task.completed    {taskId, status: "MERGED" | "FAILED" | "CANCELLED"}
+```
+
+订阅钩子: 若 `.htask/hooks/on-<type>` 存在且可执行, 事件发生时 spawn 执行
+(参数 = 事件 JSON, cwd = 项目根), 失败仅 warn 不阻断。
+
+`htask events [--tail N]` 查看最近 N 条事件 (默认 10, JSON Lines 输出)。
+
+## Artifact Bundle (`.htask/artifacts/<taskId>/`)
+
+每任务独立产物目录, 可复盘可审计 (衍生产物, 删掉不影响任务状态, 下次状态变更自动重建):
+
+```
+TASK.md          # 任务定义副本 (start 时复制)
+PLAN.md          # Planner 分析结果 (JSON)
+REVIEW.md        # reviewer 输出 (--review 时)
+REPORT.md        # 验证报告 (与项目根 REPORT.md 同步)
+diff.patch       # merge 时 git diff 快照 (排除内置保护文件)
+metrics.json     # {durationMs, tokens, iterations, model, agent} (终态/报告时写)
+timeline.json    # 状态迁移时间线 (与 tasks/<id>.json 的 history 同步)
+```
+
+`htask status --json` / `htask list --json` 增加 `artifactDir` 字段。
 
 ## 用法
 
 ```bash
-htask start [--model <provider/model>] [--agent <agent>] [--review] [--id <id>] [TASK.md]
+htask plan [TASK.md] [--json]     # 分析复杂度/风险/推荐 pipeline
+htask start [--model <provider/model>] [--agent <agent>] [--review] [--no-review] [--id <id>] [TASK.md]
 htask status [--id <id> | --all] [--json]
 htask list [--json]                 # = status --all 别名
 htask accept [--id <id>]
 htask merge [--id <id>] [--no-push]
 htask advance [--id <id>] [--no-push] [--json]
 htask cancel [--id <id>]
+htask events [--tail N]           # 查看最近事件 (默认 10)
 htask report
 htask --help
 ```
@@ -75,13 +125,16 @@ htask --help
 
 `htask start` 流程 (状态流转):
 
-1. 创建任务 → `CREATED`; 解析 TASK.md (标题 + `## Verification Commands` 下的 bash 命令) → 成功 `PLANNING`, 失败 `FAILED`。
-2. `IMPLEMENTING`: spawn `opencode run --pure -m deepseek/deepseek-v4-flash "按 TASK.md 实现，完成后总结"`, 日志到 `.htask/logs/<id>.log`, exit≠0 → `FAILED`。
-3. 退出后 osascript 弹窗通知 (✅/❌ + 耗时)。
-4. `--review`: `REVIEWING` → 跑 reviewer agent → 记录结果到 state.review → `VERIFYING`。
-5. 逐条执行验证命令 (超时 600s/条), 记录 exit code / 耗时 / 输出摘要 (截断 2000 字符)。
-6. 全绿 → 停在 `VERIFYING`, 打印 "下一步: htask accept"; 有失败 → `FAILED`。
-7. 生成 REPORT.md (状态机状态 + 迁移历史 + 验证结果表)。
+1. 创建任务 → `CREATED`; 复制 TASK.md 到 `artifacts/<id>/`, 自动调 Planner 写 `state.plan` 并生成 `PLAN.md`, 打印 `📋 计划: …`。
+2. 解析 TASK.md (标题 + `## Verification Commands` 下的 bash 命令) → 成功 `PLANNING`, 失败 `FAILED`。
+3. `IMPLEMENTING`: spawn `opencode run --pure -m deepseek/deepseek-v4-flash "按 TASK.md 实现，完成后总结"`, 日志到 `.htask/logs/<id>.log`, exit≠0 → `FAILED`。
+4. 退出后 osascript 弹窗通知 (✅/❌ + 耗时)。
+5. review (显式 `--review` 或 Planner `suggestReview` 且未 `--no-review`): `REVIEWING` → 跑 reviewer agent → 记录结果到 state.review, REVIEW.md 复制到 `artifacts/<id>/` → `VERIFYING`。
+6. 逐条执行验证命令 (超时 600s/条), 记录 exit code / 耗时 / 输出摘要 (截断 2000 字符)。
+7. 全绿 → 停在 `VERIFYING`, 打印 "下一步: htask accept"; 有失败 → `FAILED`。
+8. 生成 REPORT.md (项目根 + `artifacts/<id>/`) 与 metrics.json。
+
+整个过程中状态迁移发事件到 `.htask/events.jsonl` (created/started/verifying/waiting_human/completed 等)。
 
 `htask status` 显示当前任务状态 + 迁移历史 + 下一步建议 (如 `等待人工: htask accept`)。
 `htask list` 表格列出所有任务 (id / 标题 / 状态 / 停留时长 / 卡住标记)。

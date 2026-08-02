@@ -20,6 +20,14 @@ import {
   cmdAdvance,
   cmdCancel,
   cmdList,
+  cmdPlan,
+  cmdEvents,
+  analyzeTask,
+  emitEvent,
+  artifactDir,
+  ensureArtifactDir,
+  writeTimeline,
+  writeMetrics,
   deriveState,
   taskToJson,
   listToJson,
@@ -1121,4 +1129,310 @@ test('main 分发: 未知命令报错, --help 打印用法, list 可用', async 
     console.error = origErr;
     process.exitCode = oldExit;
   }
+});
+
+// ---------- Task Planner (analyzeTask / cmdPlan) ----------
+
+test('analyzeTask: 复杂度判定 (关键字与长度)', () => {
+  assert.equal(analyzeTask('# 安全认证系统').complexity, 'high');
+  assert.equal(analyzeTask('# 架构重构迁移').complexity, 'high');
+  assert.equal(analyzeTask('# 数据库 schema 变更').complexity, 'high');
+  assert.equal(analyzeTask('# 新增功能接口').complexity, 'medium');
+  assert.equal(analyzeTask('# 写个测试工具').complexity, 'medium');
+  assert.equal(analyzeTask('# 简单任务').complexity, 'low');
+  assert.equal(analyzeTask('x'.repeat(3001)).complexity, 'high'); // >3000 字
+  assert.equal(analyzeTask('x'.repeat(1500)).complexity, 'medium'); // 1000-3000 字
+  assert.equal(analyzeTask('x'.repeat(500)).complexity, 'low');
+});
+
+test('analyzeTask: risk 关键字命中', () => {
+  const plan = analyzeTask('涉及数据库 schema 迁移、oauth 认证、接口路由与第三方依赖');
+  assert.deepEqual(plan.risk, ['security', 'database', 'api', 'dependency']);
+  assert.deepEqual(analyzeTask('# 简单任务').risk, []);
+});
+
+test('analyzeTask: pipeline 按复杂度生成, risk 插入角色', () => {
+  assert.deepEqual(analyzeTask('# 架构重构 + 安全认证 oauth + 数据库迁移').pipeline, [
+    'architect',
+    'developer',
+    'schema-check',
+    'security-reviewer',
+    'tester',
+  ]);
+  assert.deepEqual(analyzeTask('# 新增功能接口').pipeline, ['developer', 'reviewer', 'tester']);
+  assert.deepEqual(analyzeTask('# 新增功能接口 + 权限控制').pipeline, [
+    'developer',
+    'security-reviewer',
+    'reviewer',
+    'tester',
+  ]);
+  assert.deepEqual(analyzeTask('# 简单任务').pipeline, ['developer', 'tester']);
+});
+
+test('analyzeTask: suggestReview 规则 + estimated/suggestModel', () => {
+  assert.equal(analyzeTask('# 简单任务').suggestReview, false);
+  assert.equal(analyzeTask('# 新增功能接口').suggestReview, true);
+  assert.equal(analyzeTask('# 含 oauth 权限').suggestReview, true);
+  const high = analyzeTask('# 安全架构');
+  assert.deepEqual(high.estimated, { files: 6, minutes: 40 });
+  assert.equal(high.suggestModel, 'deepseek/deepseek-v4-flash');
+  assert.deepEqual(analyzeTask('# 简单任务').estimated, { files: 2, minutes: 10 });
+});
+
+test('cmdPlan --json 输出纯 JSON; 高复杂度含 security-reviewer', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(path.join(dir, 'TASK.md'), '# TASK — 安全重构\n\n涉及 数据库迁移 schema 与 oauth 认证\n');
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  let res;
+  try {
+    res = await cmdPlan({ cwd: dir, json: true });
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(res.ok, true);
+  const plan = JSON.parse(logs[0]);
+  assert.equal(plan.complexity, 'high');
+  assert.ok(plan.risk.includes('security'));
+  assert.ok(plan.pipeline.includes('security-reviewer'));
+  assert.equal(plan.suggestReview, true);
+});
+
+test('cmdPlan 无参数读当前 TASK.md; 文件缺失报错退出码 1', async (t) => {
+  const dir = await makeTempDir(t);
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  try {
+    await cmdPlan({ cwd: dir });
+    assert.equal(process.exitCode, 1);
+  } finally {
+    process.exitCode = oldExit;
+  }
+  await writeFile(path.join(dir, 'TASK.md'), '# TASK — 安全认证\n');
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdPlan({ cwd: dir });
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(logs.some((l) => l.includes('复杂度: high')));
+});
+
+// ---------- Event System (emitEvent / hooks / cmdEvents) ----------
+
+test('emitEvent 追加 JSON Lines 到 events.jsonl (含 ts)', async (t) => {
+  const dir = await makeTempDir(t);
+  emitEvent(dir, { type: 'task.verifying', taskId: 'task-x' });
+  emitEvent(dir, { type: 'task.waiting_human', taskId: 'task-x', reason: 'accept' });
+  const lines = (await readFile(path.join(dir, '.htask', 'events.jsonl'), 'utf8')).trim().split('\n');
+  assert.equal(lines.length, 2);
+  const first = JSON.parse(lines[0]);
+  assert.equal(first.type, 'task.verifying');
+  assert.equal(first.taskId, 'task-x');
+  assert.ok(first.ts);
+  const second = JSON.parse(lines[1]);
+  assert.equal(second.reason, 'accept');
+});
+
+test('emitEvent 触发可执行 hook (参数=事件 JSON); 不存在钩子不报错', async (t) => {
+  const dir = await makeTempDir(t);
+  const hookDir = path.join(dir, '.htask', 'hooks');
+  await mkdir(hookDir, { recursive: true });
+  const hook = path.join(hookDir, 'on-task.created');
+  await writeFile(hook, '#!/bin/sh\necho "$1" > "$(dirname "$0")/hook-output.txt"\n');
+  await chmod(hook, 0o755);
+  const task = await createTask(dir, { title: 'hook任务' });
+  const out = path.join(dir, '.htask', 'hooks', 'hook-output.txt');
+  for (let i = 0; i < 100 && !existsSync(out); i++) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(existsSync(out), 'hook 应被执行');
+  const parsed = JSON.parse(await readFile(out, 'utf8'));
+  assert.equal(parsed.type, 'task.created');
+  assert.equal(parsed.taskId, task.id);
+});
+
+test('createTask 发 task.created; transition 进终态发 task.completed', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: '事件任务' });
+  await transition(dir, task.id, 'PLANNING', 'auto');
+  await transition(dir, task.id, 'IMPLEMENTING', 'auto');
+  await transition(dir, task.id, 'VERIFYING', 'auto');
+  await transition(dir, task.id, 'ACCEPTED', 'human');
+  await transition(dir, task.id, 'MERGED', 'human');
+  const lines = (await readFile(path.join(dir, '.htask', 'events.jsonl'), 'utf8')).trim().split('\n');
+  const events = lines.map((l) => JSON.parse(l));
+  const created = events.find((e) => e.type === 'task.created');
+  assert.equal(created.taskId, task.id);
+  assert.equal(created.title, '事件任务');
+  const completed = events.filter((e) => e.type === 'task.completed');
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].status, 'MERGED');
+});
+
+test('cmdEvents --tail N 输出最近事件 (JSON Lines); 无事件时提示', async (t) => {
+  const dir = await makeTempDir(t);
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdEvents({ cwd: dir });
+    assert.ok(logs.some((l) => l.includes('(无事件)')));
+
+    await createTask(dir, { title: 'A' });
+    await createTask(dir, { title: 'B' });
+    logs.length = 0;
+    await cmdEvents({ cwd: dir, tail: 1 });
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(logs.length, 1);
+  const parsed = JSON.parse(logs[0]);
+  assert.equal(parsed.type, 'task.created');
+  assert.equal(parsed.title, 'B'); // 最近一条
+});
+
+// ---------- Artifact Bundle ----------
+
+test('createTask 建 artifacts/<id>/ 目录', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: 'x' });
+  assert.equal(artifactDir(dir, task.id), path.join(dir, '.htask', 'artifacts', task.id));
+  assert.ok(existsSync(ensureArtifactDir(dir, task.id)));
+});
+
+test('transition 写 timeline.json; 终态写 metrics.json (durationMs/model/agent)', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: 'x', model: 'gpt-4o', agent: 'dev' });
+  await transition(dir, task.id, 'PLANNING', 'auto');
+  const tl = JSON.parse(await readFile(path.join(dir, '.htask', 'artifacts', task.id, 'timeline.json'), 'utf8'));
+  assert.equal(tl.length, 2);
+  assert.equal(tl[1].from, 'CREATED');
+  assert.equal(tl[1].to, 'PLANNING');
+
+  await transition(dir, task.id, 'IMPLEMENTING', 'auto');
+  await transition(dir, task.id, 'VERIFYING', 'auto');
+  await transition(dir, task.id, 'ACCEPTED', 'human');
+  await transition(dir, task.id, 'MERGED', 'human');
+  const metrics = JSON.parse(
+    await readFile(path.join(dir, '.htask', 'artifacts', task.id, 'metrics.json'), 'utf8')
+  );
+  assert.equal(typeof metrics.durationMs, 'number');
+  assert.equal(metrics.model, 'gpt-4o');
+  assert.equal(metrics.agent, 'dev');
+});
+
+test('writeReport 同时写项目根 + artifacts/<id>/REPORT.md + metrics.json', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: '报告任务' });
+  const cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'npm run typecheck', exitCode: 0, durationMs: 100, output: 'OK' }];
+  await writeReport(dir, cur);
+  const art = path.join(dir, '.htask', 'artifacts', task.id);
+  assert.ok(existsSync(path.join(dir, 'REPORT.md')));
+  assert.ok(existsSync(path.join(art, 'REPORT.md')));
+  assert.ok(existsSync(path.join(art, 'metrics.json')));
+  const content = await readFile(path.join(art, 'REPORT.md'), 'utf8');
+  assert.ok(content.includes('# REPORT — 报告任务'));
+});
+
+test('doMerge 生成 artifacts/<id>/diff.patch', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  await writeFile(path.join(dir, 'app.js'), 'console.log(1)\n');
+  const task = await createTask(dir, { title: '合并补丁' });
+  await toAccepted(dir, task.id);
+  const res = await cmdMerge({ cwd: dir, noPush: true });
+  assert.equal(res.ok, true);
+  assert.ok(existsSync(path.join(dir, '.htask', 'artifacts', task.id, 'diff.patch')));
+  const patch = await readFile(path.join(dir, '.htask', 'artifacts', task.id, 'diff.patch'), 'utf8');
+  assert.ok(patch.includes('app.js'));
+});
+
+test('taskToJson/listToJson 含 artifactDir 字段', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: '字段' });
+  const j = taskToJson(task);
+  assert.equal(j.artifactDir, path.join('.htask', 'artifacts', task.id));
+  const l = listToJson([task]);
+  assert.equal(l.tasks[0].artifactDir, path.join('.htask', 'artifacts', task.id));
+  assert.ok(existsSync(path.join(dir, j.artifactDir)));
+});
+
+// ---------- cmdStart 集成 Planner ----------
+
+test('cmdStart 高复杂度任务: plan 写入 state, artifacts 齐全, 事件齐全, 默认开 review', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = path.join(dir, 'TASK.md');
+  await writeFile(
+    task,
+    `# TASK — 安全重构升级
+
+涉及 数据库迁移 schema 与 oauth 认证 权限控制
+
+## Verification Commands
+
+\`\`\`bash
+node -e "console.log('ok')"
+\`\`\`
+`
+  );
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: task });
+    assert.equal(res.ok, true);
+    const id = await currentId(dir);
+    const tsk = await taskById(dir, id);
+    assert.equal(tsk.plan.complexity, 'high');
+    assert.ok(tsk.plan.pipeline.includes('security-reviewer'));
+    assert.ok(tsk.history.map((h) => h.to).includes('REVIEWING')); // suggestReview → 默认开 review
+
+    const art = path.join(dir, '.htask', 'artifacts', id);
+    assert.ok(existsSync(path.join(art, 'TASK.md')));
+    assert.ok(existsSync(path.join(art, 'PLAN.md')));
+    assert.ok(existsSync(path.join(art, 'REPORT.md')));
+    assert.ok(existsSync(path.join(art, 'metrics.json')));
+    assert.ok(existsSync(path.join(art, 'timeline.json')));
+
+    const events = (await readFile(path.join(dir, '.htask', 'events.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+    const types = events.map((e) => e.type);
+    assert.ok(types.includes('task.created'));
+    assert.ok(types.includes('task.started'));
+    assert.ok(types.includes('task.verifying'));
+    assert.ok(types.includes('task.waiting_human'));
+  });
+});
+
+test('cmdStart --no-review 关闭 Planner 建议的 review', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = path.join(dir, 'TASK.md');
+  await writeFile(task, `# TASK — 安全重构升级\n\n涉及 数据库迁移 schema 与 oauth 认证\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`);
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: task, noReview: true });
+    assert.equal(res.ok, true);
+    const tsk = await taskById(dir, await currentId(dir));
+    assert.ok(tsk.plan.suggestReview === true);
+    assert.ok(!tsk.history.map((h) => h.to).includes('REVIEWING'));
+  });
+});
+
+test('cmdStart 低复杂度任务: suggestReview=false 默认不开 review', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = path.join(dir, 'TASK.md');
+  await writeFile(task, `# TASK — 简单任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`);
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: task });
+    assert.equal(res.ok, true);
+    const tsk = await taskById(dir, await currentId(dir));
+    assert.equal(tsk.plan.complexity, 'low');
+    assert.ok(!tsk.history.map((h) => h.to).includes('REVIEWING'));
+  });
 });

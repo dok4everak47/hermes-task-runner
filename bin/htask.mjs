@@ -5,7 +5,7 @@
 // 零 npm 依赖: 只用 node 内置模块。
 
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -229,6 +229,84 @@ export async function readAllTasks(cwd) {
   return tasks;
 }
 
+// ---------- Artifact Bundle ----------
+
+// 每任务独立产物目录 .htask/artifacts/<taskId>/: TASK.md/PLAN.md/REVIEW.md/REPORT.md/
+// diff.patch/metrics.json/timeline.json。artifacts 是衍生产物 (非状态源), 删掉可随时重建。
+
+export function artifactDir(cwd, taskId) {
+  return path.join(cwd, '.htask', 'artifacts', taskId);
+}
+
+// 确保产物目录存在 (状态变更时缺失会自动重建), 返回目录路径
+export function ensureArtifactDir(cwd, taskId) {
+  const dir = artifactDir(cwd, taskId);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// timeline.json: 与 tasks/<id>.json 的 history 同步, 冗余一份供复盘
+export async function writeTimeline(cwd, task) {
+  if (!task?.id) return;
+  try {
+    const dir = ensureArtifactDir(cwd, task.id);
+    const history = Array.isArray(task.history) ? task.history : [];
+    await writeFile(path.join(dir, 'timeline.json'), JSON.stringify(history, null, 2) + '\n');
+  } catch (err) {
+    console.warn(`⚠️ 写入 timeline.json 失败: ${err.message}`);
+  }
+}
+
+// metrics.json: durationMs 从 startedAt 算 (未终态按当前时刻), model/agent 取自任务字段
+export async function writeMetrics(cwd, task) {
+  if (!task?.id) return;
+  const started = task.startedAt ? new Date(task.startedAt).getTime() : null;
+  const ended = task.endedAt ? new Date(task.endedAt).getTime() : null;
+  const metrics = {
+    durationMs: started ? Math.max(0, (ended ?? Date.now()) - started) : null,
+    tokens: task.tokens ?? null,
+    iterations: task.iterations ?? null,
+    model: task.model ?? null,
+    agent: task.agent ?? null,
+  };
+  try {
+    const dir = ensureArtifactDir(cwd, task.id);
+    await writeFile(path.join(dir, 'metrics.json'), JSON.stringify(metrics, null, 2) + '\n');
+  } catch (err) {
+    console.warn(`⚠️ 写入 metrics.json 失败: ${err.message}`);
+  }
+}
+
+// ---------- Event System ----------
+
+// 追加事件到 .htask/events.jsonl (JSON Lines), 并调用可选的订阅钩子。
+// 钩子: .htask/hooks/on-<type> 存在且可执行时 spawn, 参数=事件 JSON, cwd=项目根。
+// 钩子失败仅 warn 不阻断主流程。
+export function emitEvent(cwd, event) {
+  const record = { ts: new Date().toISOString(), ...event };
+  try {
+    mkdirSync(path.join(cwd, '.htask'), { recursive: true });
+    appendFileSync(path.join(cwd, '.htask', 'events.jsonl'), JSON.stringify(record) + '\n');
+  } catch (err) {
+    console.warn(`⚠️ 写入事件失败: ${err.message}`);
+  }
+  const hook = path.join(cwd, '.htask', 'hooks', `on-${record.type}`);
+  try {
+    accessSync(hook, constants.X_OK);
+  } catch {
+    return; // 钩子不存在或不可执行
+  }
+  try {
+    const child = spawn(hook, [JSON.stringify(record)], { cwd, stdio: 'ignore' });
+    child.on('error', (err) => console.warn(`⚠️ hook ${hook} 执行失败: ${err.message}`));
+    child.on('exit', (code) => {
+      if (code !== 0) console.warn(`⚠️ hook ${hook} 退出码 ${code}`);
+    });
+  } catch (err) {
+    console.warn(`⚠️ hook 执行失败: ${err.message}`);
+  }
+}
+
 // 创建任务: 写 tasks/<id>.json (状态 CREATED), 更新 state.json 指针
 export async function createTask(cwd, meta) {
   const id = meta.id || newTaskId(meta.title || 'task');
@@ -240,6 +318,7 @@ export async function createTask(cwd, meta) {
     agent: meta.agent ?? null,
     model: meta.model ?? DEFAULT_MODEL,
     taskFile: meta.taskFile ?? 'TASK.md',
+    plan: null,
     review: null,
     verification: null,
     history: [{ from: null, to: 'CREATED', at: now, by: 'auto' }],
@@ -252,6 +331,8 @@ export async function createTask(cwd, meta) {
   };
   await writeTask(cwd, task);
   await writeState(cwd, { currentId: id });
+  ensureArtifactDir(cwd, id);
+  emitEvent(cwd, { type: 'task.created', taskId: task.id, title: task.title });
   return task;
 }
 
@@ -271,6 +352,11 @@ export async function transition(cwd, id, to, by = 'auto') {
   task.updatedAt = new Date().toISOString();
   if (TERMINAL.has(to)) task.endedAt = task.endedAt ?? task.updatedAt;
   await writeTask(cwd, task);
+  await writeTimeline(cwd, task);
+  if (TERMINAL.has(to)) {
+    await writeMetrics(cwd, task);
+    emitEvent(cwd, { type: 'task.completed', taskId: id, status: to });
+  }
   return task;
 }
 
@@ -386,6 +472,64 @@ export function parseTaskFile(md) {
   return { title, verifyCommands };
 }
 
+// ---------- Task Planner ----------
+
+// 纯规则任务分析 (零依赖, 不用 LLM — 保持可测可离线):
+//   complexity: high (架构|重构|迁移|安全|认证|oauth|数据库|schema 或 >3000 字)
+//               medium (功能|接口|api|测试|工具 或 1000-3000 字) / low (其他)
+//   risk: security/database/api/dependency 关键字命中集合
+//   pipeline: 按 complexity 生成, risk 含 security → 插 security-reviewer, 含 database → 插 schema-check
+export function analyzeTask(md) {
+  const text = String(md ?? '');
+  const len = text.length;
+
+  let complexity = 'low';
+  if (/架构|重构|迁移|安全|认证|oauth|数据库|schema/.test(text) || len > 3000) {
+    complexity = 'high';
+  } else if (/功能|接口|api|测试|工具/.test(text) || (len >= 1000 && len <= 3000)) {
+    complexity = 'medium';
+  }
+
+  const risk = [];
+  if (/安全|认证|oauth|注入|权限/.test(text)) risk.push('security');
+  if (/数据库|schema|迁移|migration/.test(text)) risk.push('database');
+  if (/接口|api|路由/.test(text)) risk.push('api');
+  if (/依赖|引入|require/.test(text)) risk.push('dependency');
+
+  let pipeline;
+  if (complexity === 'high') pipeline = ['architect', 'developer', 'security-reviewer', 'tester'];
+  else if (complexity === 'medium') pipeline = ['developer', 'reviewer', 'tester'];
+  else pipeline = ['developer', 'tester'];
+
+  const insertAfter = (arr, ref, item) => {
+    const i = arr.indexOf(ref);
+    arr.splice(i === -1 ? arr.length : i + 1, 0, item);
+    return arr;
+  };
+  if (risk.includes('security') && !pipeline.includes('security-reviewer')) {
+    insertAfter(pipeline, 'developer', 'security-reviewer');
+  }
+  if (risk.includes('database') && !pipeline.includes('schema-check')) {
+    insertAfter(pipeline, 'developer', 'schema-check');
+  }
+
+  const estimated =
+    complexity === 'high'
+      ? { files: 6, minutes: 40 }
+      : complexity === 'medium'
+        ? { files: 4, minutes: 25 }
+        : { files: 2, minutes: 10 };
+
+  return {
+    complexity,
+    risk,
+    pipeline,
+    estimated,
+    suggestModel: DEFAULT_MODEL,
+    suggestReview: complexity !== 'low' || risk.length > 0,
+  };
+}
+
 // ---------- OpenCode 启动 ----------
 
 // 组装 opencode 参数: 前缀 (可被环境变量覆盖) + --model/--agent 覆盖
@@ -434,7 +578,13 @@ export function spawnOpenCode(cwd, args, prompt, logName = 'implement.log') {
       /* 静默 */
     }
 
-    const child = spawn(cmd, fullArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(cmd, fullArgs, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // opencode 内部跑命令用 $SHELL; zsh 加载 .zshrc 会产生 direnv/zoxide/starship 噪音
+      // (nix shell PATH 下找不到) — 统一用 bash, 输出干净
+      env: { ...process.env, SHELL: process.env.HTASK_SHELL || '/bin/bash' },
+    });
     child.stdout?.on('data', (d) => {
       try {
         appendFileSync(logPath, d);
@@ -557,12 +707,21 @@ export async function writeReport(cwd, ctx) {
     });
   }
 
-  await writeFile(path.join(cwd, 'REPORT.md'), lines.join('\n') + '\n');
+  const content = lines.join('\n') + '\n';
+  await writeFile(path.join(cwd, 'REPORT.md'), content);
+  if (ctx.id) {
+    try {
+      await writeFile(path.join(ensureArtifactDir(cwd, ctx.id), 'REPORT.md'), content);
+    } catch (err) {
+      console.warn(`⚠️ 写入 artifacts REPORT.md 失败: ${err.message}`);
+    }
+  }
+  await writeMetrics(cwd, ctx);
 }
 
 // ---------- 命令: start ----------
 
-export async function cmdStart({ cwd, taskFile, model, agent, review, id }) {
+export async function cmdStart({ cwd, taskFile, model, agent, review, id, noReview }) {
   const ht = path.join(cwd, '.htask');
   const lock = path.join(ht, 'state.lock');
   await mkdir(ht, { recursive: true });
@@ -594,6 +753,24 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id }) {
       taskFile: path.basename(taskFile),
     });
 
+    // 1.5 自动 Planner: 写 state.plan + artifacts (TASK.md 副本 / PLAN.md), 并按建议定默认 review
+    const plan = md ? analyzeTask(md) : null;
+    if (plan) {
+      task.plan = plan;
+      await writeTask(cwd, task);
+    }
+    try {
+      const aDir = ensureArtifactDir(cwd, task.id);
+      if (md) await writeFile(path.join(aDir, 'TASK.md'), md);
+      if (plan) await writeFile(path.join(aDir, 'PLAN.md'), JSON.stringify(plan, null, 2) + '\n');
+    } catch (err) {
+      console.warn(`⚠️ 写入 artifacts 失败: ${err.message}`);
+    }
+    const useReview = !!review || (!!plan?.suggestReview && !noReview);
+    if (plan) {
+      console.log(`📋 计划: complexity=${plan.complexity}, risk=[${plan.risk.join(', ')}], pipeline=[${plan.pipeline.join(', ')}]`);
+    }
+
     // 2. 解析 TASK.md → 成功 PLANNING, 失败 FAILED
     if (parseError) {
       console.error(`❌ 解析 TASK.md 失败: ${parseError.message}`);
@@ -606,6 +783,7 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id }) {
     // 3. IMPLEMENTING → spawn opencode
     await transition(cwd, task.id, 'PLANNING', 'auto');
     await transition(cwd, task.id, 'IMPLEMENTING', 'auto');
+    emitEvent(cwd, { type: 'task.started', taskId: task.id, status: 'IMPLEMENTING' });
     console.log(`▶️  启动实现: ${path.basename(taskFile)} (model=${task.model}${agent ? `, agent=${agent}` : ''})`);
     const args = buildOpenCodeArgs({ model, agent });
     const logName = `logs/${task.id}.log`;
@@ -629,7 +807,7 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id }) {
     }
 
     // 4. --review → REVIEWING → reviewer → 记录 review 结果 → VERIFYING
-    if (review) {
+    if (useReview) {
       await transition(cwd, task.id, 'REVIEWING', 'auto');
       console.log('🧐 运行 reviewer agent...');
       const revLog = `logs/${task.id}.review.log`;
@@ -642,9 +820,22 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id }) {
       task = await readTask(cwd, task.id);
       task.review = rev.exitCode === 0 ? 'passed' : 'failed';
       await writeTask(cwd, task);
-      if (rev.exitCode !== 0) console.warn(`⚠️ reviewer 退出码 ${rev.exitCode}, 详见 .htask/${revLog}`);
+      if (rev.exitCode !== 0) {
+        console.warn(`⚠️ reviewer 退出码 ${rev.exitCode}, 详见 .htask/${revLog}`);
+        emitEvent(cwd, { type: 'task.review_failed', taskId: task.id });
+      }
+      try {
+        const reviewSrc = path.join(cwd, 'REVIEW.md');
+        if (existsSync(reviewSrc)) {
+          const dest = path.join(ensureArtifactDir(cwd, task.id), 'REVIEW.md');
+          await writeFile(dest, await readFile(reviewSrc, 'utf8'));
+        }
+      } catch (err) {
+        console.warn(`⚠️ 复制 REVIEW.md 到 artifacts 失败: ${err.message}`);
+      }
     }
     await transition(cwd, task.id, 'VERIFYING', 'auto');
+    emitEvent(cwd, { type: 'task.verifying', taskId: task.id });
 
     // 5. 验证 → 全绿停 VERIFYING (等人工 accept), 有失败 FAILED
     if (verifyCommands.length === 0) {
@@ -662,6 +853,7 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id }) {
     const allPass = verify.every((r) => r.exitCode === 0);
     if (allPass) {
       console.log('✅ 验证全过, 下一步: htask accept');
+      emitEvent(cwd, { type: 'task.waiting_human', taskId: task.id, reason: 'accept' });
     } else {
       await transition(cwd, task.id, 'FAILED', 'auto');
       console.error('❌ 验证有失败项:');
@@ -713,6 +905,7 @@ export async function cmdAccept({ cwd, id }) {
     return { ok: false, reason: 'verify-failed' };
   }
   await transition(cwd, task.id, 'ACCEPTED', 'human');
+  emitEvent(cwd, { type: 'task.waiting_human', taskId: task.id, reason: 'merge' });
   console.log(`✅ ${task.id} → ACCEPTED, 下一步: htask merge`);
   return { ok: true };
 }
@@ -728,6 +921,25 @@ function unstageExcluded(cwd) {
   }
 }
 
+// merge 时生成 git diff 快照到 artifacts/<id>/diff.patch (暂存+工作区 vs HEAD, 排除内置保护文件)。
+// 需在 git add -A 之后调用, 否则新建文件 (untracked) 不会出现在 diff 里。
+async function writeDiffPatch(cwd, task) {
+  if (!task?.id) return;
+  try {
+    const dir = ensureArtifactDir(cwd, task.id);
+    const excludes = MERGE_EXCLUDE.map((f) => `:(exclude)${f}`);
+    const diff = spawnSync('git', ['diff', 'HEAD', '--', '.', ...excludes], {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    const content = diff.status === 0 ? (diff.stdout ?? '') : `[git diff 失败: ${(diff.stderr ?? '').trim()}]`;
+    await writeFile(path.join(dir, 'diff.patch'), content);
+  } catch (err) {
+    console.warn(`⚠️ 生成 diff.patch 失败: ${err.message}`);
+  }
+}
+
 // git add/commit/push + transition MERGED, 供 cmdMerge / cmdAdvance 复用。
 // json 模式下进度消息走 stderr, 保持 stdout 只有 JSON。
 export async function doMerge(cwd, task, { noPush = false, by = 'human', json = false } = {}) {
@@ -740,6 +952,7 @@ export async function doMerge(cwd, task, { noPush = false, by = 'human', json = 
     return { ok: false, reason: 'commit-failed' };
   }
   unstageExcluded(cwd);
+  await writeDiffPatch(cwd, task);
   const commit = spawnSync('git', ['commit', '-m', String(task.title), '--no-verify'], {
     cwd,
     encoding: 'utf8',
@@ -896,6 +1109,7 @@ export function taskToJson(task) {
     endedAt: task.endedAt ?? null,
     stale: stale ? { reason: stale.reason } : null,
     nextStep: nextStep(task),
+    artifactDir: task.id ? path.join('.htask', 'artifacts', task.id) : null,
   };
 }
 
@@ -916,6 +1130,7 @@ export function listToJson(tasks) {
         updatedAt: t.updatedAt,
         stale: stale ? { reason: stale.reason } : null,
         nextStep: nextStep(t),
+        artifactDir: t.id ? path.join('.htask', 'artifacts', t.id) : null,
       };
     }),
     summary: { total: tasks.length, byStatus },
@@ -1020,6 +1235,56 @@ export async function cmdReport({ cwd }) {
   console.log('📝 REPORT.md 已根据已有状态重新生成');
 }
 
+// ---------- 命令: plan ----------
+
+// htask plan [TASK.md] [--json]: 纯规则分析复杂度/风险/推荐 pipeline (不用 LLM)
+export async function cmdPlan({ cwd, taskFile, json }) {
+  const file = taskFile || 'TASK.md';
+  const abs = path.isAbsolute(file) ? file : path.join(cwd, file);
+  let md;
+  try {
+    md = await readFile(abs, 'utf8');
+  } catch (err) {
+    console.error(`❌ 读取 ${file} 失败: ${err.message}`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'read-error' };
+  }
+  const plan = analyzeTask(md);
+  if (json) {
+    console.log(JSON.stringify(plan, null, 2));
+  } else {
+    console.log(`复杂度: ${plan.complexity}`);
+    console.log(`风险: ${plan.risk.length > 0 ? plan.risk.join(', ') : '无'}`);
+    console.log(`推荐 pipeline: ${plan.pipeline.join(' → ')}`);
+    console.log(`预计: ${plan.estimated.files} 文件 / ${plan.estimated.minutes} 分钟`);
+    console.log(`建议模型: ${plan.suggestModel}`);
+    console.log(`建议 review: ${plan.suggestReview ? '是' : '否'}`);
+  }
+  return { ok: true, plan };
+}
+
+// ---------- 命令: events ----------
+
+// htask events [--tail N]: 查看最近 N 条事件 (默认 10, JSON Lines 输出)
+export async function cmdEvents({ cwd, tail }) {
+  const file = path.join(cwd, '.htask', 'events.jsonl');
+  let lines = [];
+  try {
+    const raw = await readFile(file, 'utf8');
+    lines = raw.split('\n').filter((l) => l.trim().length > 0);
+  } catch {
+    /* 无事件文件 */
+  }
+  const n = Number.isFinite(Number(tail)) && Number(tail) > 0 ? Number(tail) : 10;
+  const last = lines.slice(-n);
+  if (lines.length === 0) {
+    console.log('(无事件)');
+    return { ok: true, count: 0 };
+  }
+  for (const l of last) console.log(l);
+  return { ok: true, count: last.length };
+}
+
 // ---------- CLI 入口 ----------
 
 function printHelp() {
@@ -1027,13 +1292,15 @@ function printHelp() {
 状态机: CREATED → PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → ACCEPTED → MERGED (FAILED / CANCELLED)
 
 用法:
-  htask start [--model <provider/model>] [--agent <agent>] [--review] [--id <id>] [TASK.md]
+  htask plan [TASK.md] [--json]
+  htask start [--model <provider/model>] [--agent <agent>] [--review] [--no-review] [--id <id>] [TASK.md]
   htask status [--id <id> | --all] [--json]
   htask list [--json]
   htask accept [--id <id>]
   htask merge [--id <id>] [--no-push]
   htask advance [--id <id>] [--no-push] [--json]
   htask cancel [--id <id>]
+  htask events [--tail N]
   htask report
   htask --help
 
@@ -1041,10 +1308,12 @@ function printHelp() {
   --model <provider/model>   覆盖模型 (默认 ${DEFAULT_MODEL})
   --agent <agent>            指定 opencode agent
   --review                   验证通过后运行 reviewer agent 生成 REVIEW.md
+  --no-review                关闭 Planner 建议的自动 review
   --id <id>                  指定任务 id (默认当前任务)
   --all                      列出所有任务
   --no-push                  merge/advance 时跳过 git push
-  --json                     status/list/advance 输出 JSON (可 JSON.parse)
+  --json                     plan/status/list/advance 输出 JSON (可 JSON.parse)
+  --tail N                   events 查看最近 N 条 (默认 10)
   advance                    自动推进可自动的迁移: VERIFYING(全过)→ACCEPTED→MERGED
 
 环境变量 (测试注入):
@@ -1065,16 +1334,21 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
     if (a === '--model') opts.model = rest[++i];
     else if (a === '--agent') opts.agent = rest[++i];
     else if (a === '--review') opts.review = true;
+    else if (a === '--no-review') opts.noReview = true;
     else if (a === '--id') opts.id = rest[++i];
     else if (a === '--all') opts.all = true;
     else if (a === '--no-push') opts.noPush = true;
     else if (a === '--json') opts.json = true;
+    else if (a === '--tail') opts.tail = rest[++i];
     else opts.taskFile = a;
   }
 
   switch (cmd) {
+    case 'plan':
+      await cmdPlan({ cwd, taskFile: opts.taskFile, json: opts.json });
+      break;
     case 'start':
-      await cmdStart({ cwd, taskFile: opts.taskFile || 'TASK.md', model: opts.model, agent: opts.agent, review: opts.review, id: opts.id });
+      await cmdStart({ cwd, taskFile: opts.taskFile || 'TASK.md', model: opts.model, agent: opts.agent, review: opts.review, noReview: opts.noReview, id: opts.id });
       break;
     case 'status':
       await cmdStatus({ cwd, id: opts.id, all: opts.all, json: opts.json });
@@ -1093,6 +1367,9 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
       break;
     case 'cancel':
       await cmdCancel({ cwd, id: opts.id });
+      break;
+    case 'events':
+      await cmdEvents({ cwd, tail: opts.tail });
       break;
     case 'report':
       await cmdReport({ cwd });
