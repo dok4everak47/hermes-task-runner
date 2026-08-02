@@ -5,7 +5,7 @@
 // 零 npm 依赖: 只用 node 内置模块。
 
 import { spawn, spawnSync } from 'node:child_process';
-import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -309,6 +309,60 @@ export function emitEvent(cwd, event) {
   }
 }
 
+// ---------- 可观测性: progress.json ----------
+
+// 状态 → stage (派生自状态机, 供外部消费: 菜单栏/手机端读 progress.json 即知阶段)
+export function stageFor(status) {
+  const map = {
+    CREATED: 'created',
+    PLANNING: 'planning',
+    IMPLEMENTING: 'coding',
+    REVIEWING: 'reviewing',
+    VERIFYING: 'testing',
+    ACCEPTED: 'merging',
+    MERGED: 'finished',
+    FAILED: 'failed',
+    CANCELLED: 'cancelled',
+  };
+  return map[status] ?? (status ? String(status).toLowerCase() : 'idle');
+}
+
+// 状态 → 进度百分比 (阶段粗粒度)
+export function progressFor(status) {
+  const map = {
+    CREATED: 5,
+    PLANNING: 15,
+    IMPLEMENTING: 40,
+    REVIEWING: 60,
+    VERIFYING: 80,
+    ACCEPTED: 90,
+    MERGED: 100,
+    FAILED: 0,
+    CANCELLED: 0,
+  };
+  return map[status] ?? 0;
+}
+
+// 幂等写 .htask/progress.json (JSON.stringify + '\n')。只写不读, 消费方是外部工具。
+// 无任务 (task=null) 时写 idle 状态; 失败仅 warn 不阻断主流程。
+export function writeProgress(cwd, task, { status, stage, progress, currentAction } = {}) {
+  const entry = {
+    taskId: task?.id ?? null,
+    status: status ?? task?.status ?? 'idle',
+    stage: stage ?? (task ? stageFor(task.status) : 'idle'),
+    progress: progress ?? (task ? progressFor(task.status) : 0),
+    currentAction: currentAction ?? null,
+    startedAt: task?.startedAt ?? null,
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    mkdirSync(path.join(cwd, '.htask'), { recursive: true });
+    writeFileSync(path.join(cwd, '.htask', 'progress.json'), JSON.stringify(entry) + '\n');
+  } catch (err) {
+    console.warn(`⚠️ 写入 progress.json 失败: ${err.message}`);
+  }
+}
+
 // 创建任务: 写 tasks/<id>.json (状态 CREATED), 更新 state.json 指针
 export async function createTask(cwd, meta) {
   const id = meta.id || newTaskId(meta.title || 'task');
@@ -357,6 +411,7 @@ export async function transition(cwd, id, to, by = 'auto') {
   if (TERMINAL.has(to)) task.endedAt = task.endedAt ?? task.updatedAt;
   await writeTask(cwd, task);
   await writeTimeline(cwd, task);
+  writeProgress(cwd, task);
   if (TERMINAL.has(to)) {
     await writeMetrics(cwd, task);
     emitEvent(cwd, { type: 'task.completed', taskId: id, status: to });
@@ -715,11 +770,16 @@ export async function runAgent(cwd, backend, { model, agent } = {}, prompt, logN
 
 // ---------- 验证 ----------
 
-// 逐条执行验证命令, 超时 600s/条, 记录 exit code / 耗时 / 输出 (截断 2000 字符)
-export async function runVerifyCommands(cwd, commands) {
+// 逐条执行验证命令, 超时 600s/条, 记录 exit code / 耗时 / 输出 (截断 2000 字符)。
+// 每条命令前后发 verify 粒度事件 (test_started → test_passed|test_failed) + 更新 progress.json
+// 的 currentAction, 供外部实时观察"正在跑哪条验证"。
+export async function runVerifyCommands(cwd, commands, taskId) {
   const results = [];
+  const task = taskId ? await readTask(cwd, taskId) : null;
   for (const cmd of commands) {
     const start = Date.now();
+    emitEvent(cwd, { type: 'test_started', taskId: task?.id ?? null, detail: cmd });
+    writeProgress(cwd, task, { currentAction: `运行验证: ${cmd}` });
     const out = spawnSync(cmd, {
       cwd,
       shell: true,
@@ -742,6 +802,11 @@ export async function runVerifyCommands(cwd, commands) {
     if (output.length > OUTPUT_LIMIT) {
       output = output.slice(0, OUTPUT_LIMIT) + '\n…[输出截断]';
     }
+    emitEvent(cwd, {
+      type: exitCode === 0 ? 'test_passed' : 'test_failed',
+      taskId: task?.id ?? null,
+      detail: `${cmd} · exit ${exitCode}`,
+    });
     results.push({ command: cmd, exitCode, durationMs, output });
     console.log(`   ${exitCode === 0 ? '✅' : '❌'} ${cmd} (${fmtDuration(durationMs)})`);
   }
@@ -898,6 +963,8 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
       `▶️  启动实现: ${path.basename(taskFile)} (model=${task.model}${agent ? `, agent=${agent}` : ''}${backend.backend !== 'opencode' ? `, backend=${backend.backend}` : ''})`
     );
     const logName = `logs/${task.id}.log`;
+    // 开始通知即时弹 (不受成功<10s 噪音过滤约束)
+    notify('🔨 OpenCode 开始执行任务', task.title);
     const implement = await runAgent(
       cwd,
       backend.backend,
@@ -965,7 +1032,8 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     }
     const commands = verifyCommands.length > 0 ? verifyCommands : DEFAULT_VERIFY;
     console.log('🔍 开始验证...');
-    const verify = await runVerifyCommands(cwd, commands);
+    notify('🧪 正在运行测试', `即将执行 ${commands.length} 条验证命令`);
+    const verify = await runVerifyCommands(cwd, commands, task.id);
     task = await readTask(cwd, task.id);
     task.verify = verify;
     task.verification = verificationSummary(verify);
@@ -1369,7 +1437,7 @@ export async function cmdRetry({ cwd, id, fix, yes }) {
   }
   const commands = verifyCommands.length > 0 ? verifyCommands : DEFAULT_VERIFY;
   console.log('🔍 重新验证...');
-  const verify = await runVerifyCommands(cwd, commands);
+  const verify = await runVerifyCommands(cwd, commands, task.id);
   cur = await readTask(cwd, task.id);
   cur.verify = verify;
   cur.verification = verificationSummary(verify);
@@ -1479,8 +1547,10 @@ export async function cmdStatus({ cwd, id, all, json }) {
       else console.error(`❌ 任务不存在: ${id}`);
       process.exitCode = 1;
     } else if (json) {
+      writeProgress(cwd, null);
       console.log(JSON.stringify({ status: 'idle', state: 'IDLE', message: '没有当前任务, 先运行 htask start' }, null, 2));
     } else {
+      writeProgress(cwd, null);
       console.log('状态: idle');
     }
     return;

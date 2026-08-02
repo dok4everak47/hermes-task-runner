@@ -58,6 +58,9 @@ import {
   cmdWorktree,
   computeMetrics,
   cmdMetrics,
+  stageFor,
+  progressFor,
+  writeProgress,
 } from '../bin/htask.mjs';
 
 async function makeTempDir(t) {
@@ -82,6 +85,24 @@ async function makeFakeOpencode(dir, { exitCode = 0 } = {}) {
   await writeFile(script, body);
   await chmod(script, 0o755);
   return script;
+}
+
+// fake osascript: 把 notify 传给它的参数落到 bin/osa.log, 便于断言通知内容
+async function makeFakeOsascript(dir) {
+  const bin = path.join(dir, 'bin');
+  await mkdir(bin, { recursive: true });
+  const script = path.join(bin, 'osascript');
+  await writeFile(script, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$(dirname "$0")/osa.log"\n');
+  await chmod(script, 0o755);
+  return bin;
+}
+
+async function waitFor(pred, { tries = 100, ms = 20 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    if (await pred()) return true;
+    await new Promise((r) => setTimeout(r, ms));
+  }
+  return false;
 }
 
 function withEnv(key, value, fn) {
@@ -1308,6 +1329,232 @@ test('cmdEvents --tail N 输出最近事件 (JSON Lines); 无事件时提示', a
   const parsed = JSON.parse(logs[0]);
   assert.equal(parsed.type, 'task.created');
   assert.equal(parsed.title, 'B'); // 最近一条
+});
+
+// ---------- 可观测性: progress.json + verify 粒度事件 + 通知 ----------
+
+test('stageFor/progressFor: 状态 → stage / 百分比映射', () => {
+  assert.equal(stageFor('PLANNING'), 'planning');
+  assert.equal(stageFor('IMPLEMENTING'), 'coding');
+  assert.equal(stageFor('REVIEWING'), 'reviewing');
+  assert.equal(stageFor('VERIFYING'), 'testing');
+  assert.equal(stageFor('ACCEPTED'), 'merging');
+  assert.equal(stageFor('MERGED'), 'finished');
+  assert.equal(stageFor('FAILED'), 'failed');
+  assert.equal(stageFor('CANCELLED'), 'cancelled');
+  assert.equal(stageFor('CREATED'), 'created');
+  assert.equal(stageFor(undefined), 'idle');
+
+  assert.equal(progressFor('CREATED'), 5);
+  assert.equal(progressFor('PLANNING'), 15);
+  assert.equal(progressFor('IMPLEMENTING'), 40);
+  assert.equal(progressFor('REVIEWING'), 60);
+  assert.equal(progressFor('VERIFYING'), 80);
+  assert.equal(progressFor('ACCEPTED'), 90);
+  assert.equal(progressFor('MERGED'), 100);
+  assert.equal(progressFor('FAILED'), 0);
+  assert.equal(progressFor('CANCELLED'), 0);
+});
+
+test('writeProgress 写 .htask/progress.json (含 taskId/stage/progress/startedAt/updatedAt)', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: '进度' });
+  await transition(dir, task.id, 'PLANNING', 'auto');
+  await transition(dir, task.id, 'IMPLEMENTING', 'auto');
+  const cur = await readTask(dir, task.id);
+  writeProgress(dir, cur);
+  const p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.taskId, task.id);
+  assert.equal(p.status, 'IMPLEMENTING');
+  assert.equal(p.stage, 'coding');
+  assert.equal(p.progress, 40);
+  assert.equal(p.currentAction, null);
+  assert.ok(p.startedAt);
+  assert.ok(p.updatedAt);
+  assert.ok(p.updatedAt >= p.startedAt);
+});
+
+test('writeProgress 无任务时写 idle', async (t) => {
+  const dir = await makeTempDir(t);
+  writeProgress(dir, null);
+  const p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.taskId, null);
+  assert.equal(p.status, 'idle');
+  assert.equal(p.stage, 'idle');
+  assert.equal(p.progress, 0);
+  assert.equal(p.currentAction, null);
+});
+
+test('writeProgress 支持显式覆盖字段 + currentAction', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: 'x' });
+  writeProgress(dir, task, { status: 'VERIFYING', stage: 'testing', progress: 80, currentAction: '运行验证: node --test' });
+  const p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.status, 'VERIFYING');
+  assert.equal(p.stage, 'testing');
+  assert.equal(p.progress, 80);
+  assert.equal(p.currentAction, '运行验证: node --test');
+});
+
+test('transition 每次迁移更新 progress.json (stage/progress 反映新状态)', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: 'x' });
+  await transition(dir, task.id, 'PLANNING', 'auto');
+  let p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.stage, 'planning');
+  assert.equal(p.progress, 15);
+  await transition(dir, task.id, 'IMPLEMENTING', 'auto');
+  p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.stage, 'coding');
+  assert.equal(p.progress, 40);
+  await transition(dir, task.id, 'VERIFYING', 'auto');
+  p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.stage, 'testing');
+  assert.equal(p.progress, 80);
+  await transition(dir, task.id, 'ACCEPTED', 'human');
+  p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.stage, 'merging');
+  assert.equal(p.progress, 90);
+  await transition(dir, task.id, 'MERGED', 'human');
+  p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.stage, 'finished');
+  assert.equal(p.progress, 100);
+  assert.equal(p.taskId, task.id);
+});
+
+test('FAILED 迁移后 progress.json stage=failed progress=0', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: 'x' });
+  await transition(dir, task.id, 'PLANNING', 'auto');
+  await transition(dir, task.id, 'IMPLEMENTING', 'auto');
+  await transition(dir, task.id, 'FAILED', 'auto');
+  const p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.status, 'FAILED');
+  assert.equal(p.stage, 'failed');
+  assert.equal(p.progress, 0);
+});
+
+test('cmdStatus 无任务时写 progress.json 为 idle', async (t) => {
+  const dir = await makeTempDir(t);
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdStatus({ cwd: dir });
+  } finally {
+    console.log = orig;
+  }
+  const p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.taskId, null);
+  assert.equal(p.status, 'idle');
+  assert.equal(p.stage, 'idle');
+  assert.equal(p.progress, 0);
+});
+
+test('runVerifyCommands 发 test_started/test_passed, detail 含命令 + exitCode', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: '验证事件' });
+  const cmd = 'node -e "console.log(1)"';
+  const results = await runVerifyCommands(dir, [cmd], task.id);
+  assert.equal(results[0].exitCode, 0);
+  const events = (await readFile(path.join(dir, '.htask', 'events.jsonl'), 'utf8'))
+    .trim()
+    .split('\n')
+    .map((l) => JSON.parse(l));
+  const started = events.find((e) => e.type === 'test_started');
+  assert.ok(started, '应有 test_started');
+  assert.equal(started.taskId, task.id);
+  assert.equal(started.detail, cmd);
+  const passed = events.find((e) => e.type === 'test_passed');
+  assert.ok(passed, '应有 test_passed');
+  assert.equal(passed.taskId, task.id);
+  assert.match(passed.detail, /node -e/);
+  assert.ok(passed.detail.includes('exit 0'));
+  // 命令执行期间 progress.json currentAction 指向当前验证命令
+  const p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.taskId, task.id);
+  assert.match(p.currentAction ?? '', /运行验证/);
+});
+
+test('runVerifyCommands 失败发 test_failed, detail 含 exitCode', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: '验证失败事件' });
+  await runVerifyCommands(dir, ['node -e "process.exit(3)"'], task.id);
+  const events = (await readFile(path.join(dir, '.htask', 'events.jsonl'), 'utf8'))
+    .trim()
+    .split('\n')
+    .map((l) => JSON.parse(l));
+  const failed = events.find((e) => e.type === 'test_failed');
+  assert.ok(failed);
+  assert.equal(failed.taskId, task.id);
+  assert.ok(failed.detail.includes('exit 3'));
+});
+
+test('cmdStart 端到端: progress.json 反映 VERIFYING/testing/80 + verify 事件', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 进度任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md') });
+    assert.equal(res.ok, true);
+  });
+  const p = JSON.parse(await readFile(path.join(dir, '.htask', 'progress.json'), 'utf8'));
+  assert.equal(p.status, 'VERIFYING');
+  assert.equal(p.stage, 'testing');
+  assert.equal(p.progress, 80);
+  assert.ok(p.taskId);
+  assert.match(p.currentAction ?? '', /运行验证/);
+  const events = (await readFile(path.join(dir, '.htask', 'events.jsonl'), 'utf8'))
+    .trim()
+    .split('\n')
+    .map((l) => JSON.parse(l));
+  assert.ok(events.some((e) => e.type === 'test_started' && e.detail.includes('console.log')));
+  assert.ok(events.some((e) => e.type === 'test_passed'));
+});
+
+test('cmdStart 通知节点: 开始 🔨 + 测试 🧪 即时弹出 (HTASK_NOTIFY 未禁用时)', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 通知任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const script = await makeFakeOpencode(dir);
+  const osaBin = await makeFakeOsascript(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    await withEnv('PATH', `${osaBin}:${process.env.PATH}`, async () => {
+      await withEnv('HTASK_NOTIFY', undefined, async () => {
+        const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md') });
+        assert.equal(res.ok, true);
+      });
+    });
+  });
+  const logPath = path.join(dir, 'bin', 'osa.log');
+  assert.ok(await waitFor(() => existsSync(logPath)), 'fake osascript 应被调用');
+  const log = await readFile(logPath, 'utf8');
+  assert.ok(log.includes('🔨'), `通知应含 🔨, 实际: ${log}`);
+  assert.ok(log.includes('🧪'), `通知应含 🧪, 实际: ${log}`);
+});
+
+test('cmdStart HTASK_NOTIFY=0 禁用所有通知', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 静音任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const script = await makeFakeOpencode(dir);
+  const osaBin = await makeFakeOsascript(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    await withEnv('PATH', `${osaBin}:${process.env.PATH}`, async () => {
+      await withEnv('HTASK_NOTIFY', '0', async () => {
+        const res = await cmdStart({ cwd: dir, taskFile: path.join(dir, 'TASK.md') });
+        assert.equal(res.ok, true);
+      });
+    });
+  });
+  assert.ok(!existsSync(path.join(dir, 'bin', 'osa.log')), 'HTASK_NOTIFY=0 不应弹通知');
 });
 
 // ---------- Artifact Bundle ----------
