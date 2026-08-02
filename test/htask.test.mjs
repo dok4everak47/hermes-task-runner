@@ -1730,6 +1730,15 @@ rules:
   assert.deepEqual(parseApprovalYaml('# 空文件只有注释'), {});
 });
 
+test('parseApprovalYaml: 支持行内注释 (值后 # 注释被忽略)', () => {
+  assert.deepEqual(
+    parseApprovalYaml('rules:\n  low_risk: false # 低风险自动过闸\n  high_risk: true    # 高风险需人工'),
+    { high_risk: true, low_risk: false }
+  );
+  // 字符串值内无前置空格的 # 不应被截断
+  assert.deepEqual(parseApprovalYaml('rules:\n  note: "abc#def"'), { note: 'abc#def' });
+});
+
 test('loadApprovalPolicy: 无文件默认保守; 文件生效; 解析失败 warn + 默认', async (t) => {
   const dir = await makeTempDir(t);
   const def = await loadApprovalPolicy(dir);

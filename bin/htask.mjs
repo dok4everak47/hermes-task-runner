@@ -1575,7 +1575,9 @@ export function parseApprovalYaml(text) {
 }
 
 function parseYamlScalar(v) {
-  const s = String(v).trim();
+  // 支持行内注释: 值后带空格的 # 起为注释, 如 "false # 自动过闸" → false
+  // 字符串值内无前置空格的 # (如 "abc#def") 保留原样
+  const s = String(v).replace(/\s+#.*$/, '').trim();
   if (s === 'true') return true;
   if (s === 'false') return false;
   const n = Number(s);
