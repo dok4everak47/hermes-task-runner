@@ -4,3 +4,4 @@ node_modules/
 /REPORT.md
 /REVIEW.md
 .DS_Store
+.supervisor/

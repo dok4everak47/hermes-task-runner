@@ -22,6 +22,9 @@ import {
   cmdList,
   cmdPlan,
   cmdEvents,
+  cmdRetry,
+  cmdAgents,
+  cmdPolicy,
   analyzeTask,
   emitEvent,
   artifactDir,
@@ -43,6 +46,14 @@ import {
   newTaskId,
   TERMINAL,
   main,
+  AGENT_ADAPTERS,
+  getAgentAdapter,
+  resolveAgentBackend,
+  runAgent,
+  printDiagnosis,
+  loadApprovalPolicy,
+  parseApprovalYaml,
+  approvalDecision,
 } from '../bin/htask.mjs';
 
 async function makeTempDir(t) {
@@ -1435,4 +1446,481 @@ test('cmdStart 低复杂度任务: suggestReview=false 默认不开 review', asy
     assert.equal(tsk.plan.complexity, 'low');
     assert.ok(!tsk.history.map((h) => h.to).includes('REVIEWING'));
   });
+});
+
+// ---------- Agent Adapter Layer ----------
+
+test('AGENT_ADAPTERS: opencode 可用, codex/claude 标记不可用', () => {
+  assert.equal(AGENT_ADAPTERS.opencode.available, true);
+  assert.equal(AGENT_ADAPTERS.codex.available, false);
+  assert.equal(AGENT_ADAPTERS.claude.available, false);
+  assert.ok(AGENT_ADAPTERS.opencode.runCmd.includes('opencode'));
+});
+
+test('getAgentAdapter: 内置命中/未安装/未知/自定义覆盖', async (t) => {
+  const dir = await makeTempDir(t);
+  assert.equal(getAgentAdapter(dir, 'opencode').available, true);
+  assert.equal(getAgentAdapter(dir, 'codex').available, false);
+  assert.equal(getAgentAdapter(dir, 'nope'), null);
+  // 自定义适配器 .htask/agent.myagent.json 覆盖内置同名条目
+  await mkdir(path.join(dir, '.htask'), { recursive: true });
+  await writeFile(
+    path.join(dir, '.htask', 'agent.opencode.json'),
+    JSON.stringify({ name: 'opencode', display: 'CustomOpen', available: true, runCmd: ['myopencode', 'run'], modelFlag: '-m', agentFlag: '--agent', env: {} })
+  );
+  const custom = getAgentAdapter(dir, 'opencode');
+  assert.equal(custom.display, 'CustomOpen');
+  assert.equal(custom.runCmd[0], 'myopencode');
+});
+
+test('resolveAgentBackend: 默认 opencode, 未安装/未知后端报错', async (t) => {
+  const dir = await makeTempDir(t);
+  const ok = resolveAgentBackend(dir, undefined);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.backend, 'opencode');
+  const bad = resolveAgentBackend(dir, 'codex');
+  assert.equal(bad.ok, false);
+  assert.equal(bad.error, 'unavailable');
+  assert.equal(resolveAgentBackend(dir, 'nope').ok, false);
+  // HTASK_AGENT 环境变量作为默认后端
+  await withEnv('HTASK_AGENT', 'claude', async () => {
+    assert.equal(resolveAgentBackend(dir, undefined).ok, false);
+  });
+});
+
+test('runAgent: 未安装后端清晰报错, 不执行', async (t) => {
+  const dir = await makeTempDir(t);
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  const logs = [];
+  const orig = console.error;
+  console.error = (...a) => logs.push(a.join(' '));
+  try {
+    const r = await withEnv('HTASK_OPENCODE_CMD', undefined, () => withEnv('HTASK_OPENCODE_ARGS_PREFIX', undefined, () => runAgent(dir, 'codex', {}, 'prompt', 'x.log')));
+    assert.equal(r.error, 'unavailable');
+    assert.equal(process.exitCode, 1);
+    assert.ok(logs.some((l) => l.includes("agent 后端 'codex' 未安装")));
+    assert.ok(logs.some((l) => l.includes('opencode')));
+  } finally {
+    console.error = orig;
+    process.exitCode = oldExit;
+  }
+  assert.ok(!existsSync(path.join(dir, '.htask', 'x.log')));
+});
+
+test('runAgent: 无 HTASK_OPENCODE_CMD 时按适配器组装参数执行', async (t) => {
+  const dir = await makeTempDir(t);
+  // 自定义 opencode 适配器指向假脚本
+  await mkdir(path.join(dir, '.htask'), { recursive: true });
+  const script = await makeFakeOpencode(dir);
+  await writeFile(
+    path.join(dir, '.htask', 'agent.opencode.json'),
+    JSON.stringify({ name: 'opencode', display: 'OpenCode', available: true, runCmd: [script, 'run', '--pure'], modelFlag: '-m', agentFlag: '--agent', env: {} })
+  );
+  const r = await withEnv('HTASK_OPENCODE_CMD', undefined, () =>
+    withEnv('HTASK_OPENCODE_ARGS_PREFIX', undefined, () => runAgent(dir, 'opencode', { model: 'gpt-4o', agent: 'reviewer' }, '修复并重新实现', 'impl.log'))
+  );
+  assert.equal(r.exitCode, 0);
+  const fake = await readFile(path.join(dir, 'fake.log'), 'utf8');
+  assert.ok(fake.includes('-m gpt-4o'));
+  assert.ok(fake.includes('--agent reviewer'));
+  assert.ok(fake.includes('修复并重新实现'));
+});
+
+test('cmdStart --agent-backend: 未知后端报错且不创建任务; 默认 opencode 记录 agentBackend', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = path.join(dir, 'TASK.md');
+  await writeFile(task, `# TASK — 后端任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`);
+
+  // 未知/未安装后端 → 报错, 不创建任务
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  const logs = [];
+  const origErr = console.error;
+  console.error = (...a) => logs.push(a.join(' '));
+  try {
+    const res = await cmdStart({ cwd: dir, taskFile: task, agentBackend: 'codex' });
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'agent-unavailable');
+    assert.ok(logs.some((l) => l.includes("agent 后端 'codex' 未安装")));
+  } finally {
+    console.error = origErr;
+    process.exitCode = oldExit;
+  }
+  assert.equal((await readState(dir))?.currentId, undefined); // 无任务创建
+
+  // 默认 opencode: 记录 agentBackend
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdStart({ cwd: dir, taskFile: task });
+    assert.equal(res.ok, true);
+    const tsk = await taskById(dir, await currentId(dir));
+    assert.equal(tsk.agentBackend, 'opencode');
+  });
+});
+
+test('cmdAgents: 列出 opencode 可用 + codex/claude 不可用 + 自定义', async (t) => {
+  const dir = await makeTempDir(t);
+  await mkdir(path.join(dir, '.htask'), { recursive: true });
+  await writeFile(
+    path.join(dir, '.htask', 'agent.mytool.json'),
+    JSON.stringify({ name: 'mytool', display: 'MyTool', available: true, runCmd: ['mt'], modelFlag: '-m', agentFlag: null, env: {} })
+  );
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdAgents({ cwd: dir });
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(logs.some((l) => l.includes('✅ opencode')));
+  assert.ok(logs.some((l) => l.includes('❌ codex') && l.includes('未安装')));
+  assert.ok(logs.some((l) => l.includes('❌ claude') && l.includes('未安装')));
+  assert.ok(logs.some((l) => l.includes('✅ mytool')));
+  assert.ok(logs.some((l) => l.includes('默认后端')));
+});
+
+// ---------- Failure Recovery (retry) ----------
+
+// 构造 FAILED 任务 (VERIFYING 有失败 → FAILED)
+async function makeFailedTask(dir, id, { implementExit = 7, verify } = {}) {
+  await walkTo(dir, id, 'VERIFYING');
+  let cur = await readTask(dir, id);
+  cur.implementExit = implementExit;
+  cur.implementDurationMs = 1234;
+  cur.verify = verify ?? [{ command: 'npm test', exitCode: 1, durationMs: 5, output: 'FAIL: expected 401 got 500' }];
+  await writeTask(dir, cur);
+  await transition(dir, id, 'FAILED', 'auto');
+  return cur;
+}
+
+test('cmdRetry 诊断输出: 实现/验证/日志尾部/建议', async (t) => {
+  const dir = await makeTempDir(t);
+  const id = (await createTask(dir, { title: '修复' })).id;
+  await makeFailedTask(dir, id);
+  // 写任务专属日志
+  await mkdir(path.join(dir, '.htask', 'logs'), { recursive: true });
+  await writeFile(path.join(dir, '.htask', 'logs', `${id}.log`), 'line1\nline2\nline3\nline4\nline5\n');
+
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  const res = await cmdRetry({ cwd: dir });
+  console.log = orig;
+  assert.equal(res.ok, true);
+  const out = logs.join('\n');
+  assert.ok(out.includes(`🔍 失败诊断: ${id} (FAILED)`));
+  assert.ok(out.includes('- 实现: exit 7 (1.2s)'));
+  assert.ok(out.includes('- 验证: 1 条中 1 条失败 → npm test (exit 1)'));
+  assert.ok(out.includes('- 日志尾部: line1'));
+  assert.ok(out.includes('line5'));
+  assert.ok(out.includes('验证失败 → 修复代码或调整验证命令'));
+});
+
+test('cmdRetry: 只能重试 FAILED, 其他状态拒绝; 发 task.retrying 事件', async (t) => {
+  const dir = await makeTempDir(t);
+  const task = await createTask(dir, { title: 'x' }); // CREATED
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  const logs = [];
+  const origErr = console.error;
+  console.error = (...a) => logs.push(a.join(' '));
+  try {
+    const r = await cmdRetry({ cwd: dir });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'wrong-state');
+    assert.equal(process.exitCode, 1);
+    assert.ok(logs.some((l) => l.includes('只能重试 FAILED')));
+  } finally {
+    console.error = origErr;
+    process.exitCode = oldExit;
+  }
+  // 非 FAILED 不发 retrying 事件
+  const events = (await readFile(path.join(dir, '.htask', 'events.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'task.created');
+});
+
+test('cmdRetry --fix: 无 --yes 时 (非 TTY) 取消不执行', async (t) => {
+  const dir = await makeTempDir(t);
+  const id = (await createTask(dir, { title: '修复' })).id;
+  await makeFailedTask(dir, id);
+  const logs = [];
+  const origErr = console.error;
+  const origLog = console.log;
+  console.error = (...a) => logs.push(a.join(' '));
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    const r = await cmdRetry({ cwd: dir, fix: true });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'aborted');
+  } finally {
+    console.error = origErr;
+    console.log = origLog;
+  }
+  assert.equal((await readTask(dir, id)).status, 'FAILED'); // 状态不变
+});
+
+test('cmdRetry --fix --yes: FAILED → PLANNING(retry) → IMPLEMENTING → 验证过 → VERIFYING', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 修复任务\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "console.log('ok')"\n\`\`\`\n`
+  );
+  const id = (await createTask(dir, { title: '修复任务' })).id;
+  await makeFailedTask(dir, id);
+  let cur = await readTask(dir, id); // 重新读取 (已是 FAILED)
+  cur.agentBackend = 'opencode';
+  await writeTask(dir, cur);
+
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdRetry({ cwd: dir, fix: true, yes: true });
+    assert.equal(res.ok, true);
+  });
+
+  const tsk = await readTask(dir, id);
+  assert.equal(tsk.status, 'VERIFYING');
+  assert.equal(tsk.implementExit, 0);
+  assert.equal(tsk.verify.length, 1);
+  assert.equal(tsk.verify[0].exitCode, 0);
+  assert.ok(tsk.endedAt === null); // 离开终态清除 endedAt
+  const hist = tsk.history.map((h) => `${h.from}→${h.to}:${h.by}`);
+  assert.ok(hist.includes('FAILED→PLANNING:retry'));
+  assert.ok(hist.includes('PLANNING→IMPLEMENTING:auto'));
+  assert.ok(hist.includes('IMPLEMENTING→VERIFYING:auto'));
+
+  // 事件: task.retrying + task.verifying
+  const events = (await readFile(path.join(dir, '.htask', 'events.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(events.some((e) => e.type === 'task.retrying' && e.taskId === id));
+  assert.ok(events.some((e) => e.type === 'task.verifying' && e.taskId === id));
+
+  // 提示词携带失败上下文
+  const fake = await readFile(path.join(dir, 'fake.log'), 'utf8');
+  assert.ok(fake.includes('上次失败上下文'));
+  assert.ok(fake.includes('不要重复已完成的部分'));
+});
+
+test('cmdRetry --fix --yes: 验证仍失败 → 回到 FAILED', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(
+    path.join(dir, 'TASK.md'),
+    `# TASK — 修复失败\n\n## Verification Commands\n\n\`\`\`bash\nnode -e "process.exit(1)"\n\`\`\`\n`
+  );
+  const id = (await createTask(dir, { title: '修复失败' })).id;
+  await makeFailedTask(dir, id);
+  const script = await makeFakeOpencode(dir);
+  await withEnv('HTASK_OPENCODE_CMD', script, async () => {
+    const res = await cmdRetry({ cwd: dir, fix: true, yes: true });
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'verify-failed');
+  });
+  assert.equal((await readTask(dir, id)).status, 'FAILED');
+});
+
+// ---------- Human Approval Policy ----------
+
+test('parseApprovalYaml: 解析 rules, 支持注释/布尔/缩进', () => {
+  const yaml = `# 风险类型 → 是否需要人工确认
+rules:
+  high_risk: true
+  low_risk: false`;
+  assert.deepEqual(parseApprovalYaml(yaml), { high_risk: true, low_risk: false });
+  assert.deepEqual(parseApprovalYaml('# 空文件只有注释'), {});
+});
+
+test('loadApprovalPolicy: 无文件默认保守; 文件生效; 解析失败 warn + 默认', async (t) => {
+  const dir = await makeTempDir(t);
+  const def = await loadApprovalPolicy(dir);
+  assert.equal(def.source, 'default');
+  assert.deepEqual(def.rules, { high_risk: true, low_risk: true });
+
+  await mkdir(path.join(dir, '.htask'), { recursive: true });
+  await writeFile(path.join(dir, '.htask', 'approval.yaml'), 'rules:\n  low_risk: false\n');
+  const file = await loadApprovalPolicy(dir);
+  assert.equal(file.source, 'file');
+  assert.equal(file.rules.low_risk, false);
+  assert.equal(file.rules.high_risk, true); // 未声明沿用默认
+
+  await writeFile(path.join(dir, '.htask', 'approval.yaml'), 'rules: [broken');
+  const logs = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => logs.push(a.join(' '));
+  let bad;
+  try {
+    bad = await loadApprovalPolicy(dir);
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.equal(bad.source, 'default');
+  assert.ok(logs.some((l) => l.includes('approval.yaml')));
+});
+
+test('approvalDecision: risk 非空 → high_risk; 空 → low_risk', () => {
+  const p = { rules: { high_risk: true, low_risk: false } };
+  assert.equal(approvalDecision({ risk: [], policy: p }), 'auto');
+  assert.equal(approvalDecision({ risk: ['security'], policy: p }), 'human');
+  const cons = { rules: { high_risk: true, low_risk: true } };
+  assert.equal(approvalDecision({ risk: [], policy: cons }), 'human');
+  const lax = { rules: { high_risk: false, low_risk: false } };
+  assert.equal(approvalDecision({ risk: ['database'], policy: lax }), 'auto');
+});
+
+test('cmdPlan --json: 无 risk 任务配 low_risk:false → approval:auto; 有 risk → human; 默认 → human', async (t) => {
+  const dir = await makeTempDir(t);
+  await writeFile(path.join(dir, 'TASK.md'), '# TASK — 简单任务\n');
+
+  // 默认 (无 approval.yaml) → human
+  let logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdPlan({ cwd: dir, json: true });
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(JSON.parse(logs[0]).approval, 'human');
+
+  // 配 low_risk:false → 无 risk 任务 auto
+  await mkdir(path.join(dir, '.htask'), { recursive: true });
+  await writeFile(path.join(dir, '.htask', 'approval.yaml'), 'rules:\n  low_risk: false\n');
+  logs = [];
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdPlan({ cwd: dir, json: true });
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(JSON.parse(logs[0]).approval, 'auto');
+
+  // 有 risk 的任务 → human
+  await writeFile(path.join(dir, 'TASK.md'), '# TASK — 安全重构\n\n涉及 数据库迁移 schema 与 oauth 认证\n');
+  logs = [];
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdPlan({ cwd: dir, json: true });
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(JSON.parse(logs[0]).approval, 'human');
+});
+
+test('cmdAdvance 审批闸门: 低风险 + low_risk:false → 自动 MERGED', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  await writeFile(path.join(dir, 'app.js'), 'console.log(1)\n');
+  await mkdir(path.join(dir, '.htask'), { recursive: true });
+  await writeFile(path.join(dir, '.htask', 'approval.yaml'), 'rules:\n  low_risk: false\n');
+
+  const task = await createTask(dir, { title: '自动过闸' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  cur.plan = { risk: [], complexity: 'low' }; // 无 risk → low
+  await writeTask(dir, cur);
+
+  const res = await cmdAdvance({ cwd: dir, noPush: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.action, 'merged');
+  assert.equal((await readTask(dir, task.id)).status, 'MERGED');
+  const hist = (await readTask(dir, task.id)).history.map((h) => `${h.from}→${h.to}`);
+  assert.ok(hist.includes('VERIFYING→ACCEPTED'));
+  assert.ok(hist.includes('ACCEPTED→MERGED'));
+});
+
+test('cmdAdvance 审批闸门: 高风险任务停在 VERIFYING (默认策略)', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: '高风险' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  cur.plan = { risk: ['security', 'database'], complexity: 'high' }; // 有 risk → high
+  await writeTask(dir, cur);
+
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  const res = await cmdAdvance({ cwd: dir, noPush: true });
+  console.log = orig;
+  assert.equal(res.ok, true);
+  assert.equal(res.action, 'none');
+  assert.equal((await readTask(dir, task.id)).status, 'VERIFYING'); // 停在 VERIFYING
+  assert.ok(logs.some((l) => l.includes('高风险任务')));
+});
+
+test('cmdAdvance 审批闸门: 有 plan 但默认策略 → 低风险也停在 VERIFYING (保守默认)', async (t) => {
+  const dir = await makeTempDir(t);
+  await initGitRepo(dir);
+  const task = await createTask(dir, { title: '保守默认' });
+  await walkTo(dir, task.id, 'VERIFYING');
+  let cur = await readTask(dir, task.id);
+  cur.verify = [{ command: 'true', exitCode: 0, durationMs: 1, output: '' }];
+  cur.plan = { risk: [], complexity: 'low' }; // 无 risk 但无 approval.yaml
+  await writeTask(dir, cur);
+
+  const res = await cmdAdvance({ cwd: dir, noPush: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.action, 'none');
+  assert.equal((await readTask(dir, task.id)).status, 'VERIFYING');
+
+  // accept 人工确认始终有效
+  const r = await cmdAccept({ cwd: dir });
+  assert.equal(r.ok, true);
+  assert.equal((await readTask(dir, task.id)).status, 'ACCEPTED');
+});
+
+test('cmdPolicy: 默认保守 + 文件配置展示', async (t) => {
+  const dir = await makeTempDir(t);
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdPolicy({ cwd: dir });
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(logs.some((l) => l.includes('审批策略')));
+  assert.ok(logs.some((l) => l.includes('默认')));
+  assert.ok(logs.some((l) => l.includes('高风险 (有 risk)') && l.includes('需人工')));
+
+  await mkdir(path.join(dir, '.htask'), { recursive: true });
+  await writeFile(path.join(dir, '.htask', 'approval.yaml'), 'rules:\n  low_risk: false\n');
+  logs.length = 0;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    await cmdPolicy({ cwd: dir });
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(logs.some((l) => l.includes('approval.yaml')));
+  assert.ok(logs.some((l) => l.includes('低风险 (无 risk)') && l.includes('自动过闸')));
+});
+
+test('main 分发: retry/agents/policy 命令可达', async (t) => {
+  const dir = await makeTempDir(t);
+  const logs = [];
+  const orig = console.log;
+  const origErr = console.error;
+  console.log = (...a) => logs.push(a.join(' '));
+  console.error = (...a) => logs.push(a.join(' '));
+  const oldExit = process.exitCode;
+  process.exitCode = 0;
+  try {
+    await main(['agents'], { cwd: dir });
+    assert.ok(logs.some((l) => l.includes('✅ opencode')));
+    process.exitCode = 0;
+    logs.length = 0;
+    await main(['policy'], { cwd: dir });
+    assert.ok(logs.some((l) => l.includes('审批策略')));
+    process.exitCode = 0;
+    logs.length = 0;
+    await main(['retry'], { cwd: dir });
+    assert.equal(process.exitCode, 1); // 无任务
+  } finally {
+    console.log = orig;
+    console.error = origErr;
+    process.exitCode = oldExit;
+  }
 });

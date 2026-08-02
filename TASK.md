@@ -1,136 +1,123 @@
-# TASK — htask v0.2 阶段一: Task Planner + Event System + Artifact Bundle
+# TASK — htask v0.2 阶段二: Agent Adapter + Failure Recovery + Human Approval Policy
 
 ## Goal
 
-htask 从"固定流程执行器"升级为"自适应编排器"的第一步。三个 P0 能力：
+htask 编排能力第二层。三个 P1 特性：
 
-1. **Task Planner** — 任务开始前分析复杂度/风险/推荐 pipeline（动态流程的决策层）
-2. **Event System** — 状态变化事件化（task.created/started/review_failed/completed/waiting_human），为通知/恢复/指标打地基
-3. **Artifact Bundle** — 每个任务独立产物目录（TASK.md/PLAN.md/REVIEW.md/REPORT.md/metrics.json/timeline.json），可复盘可审计
+1. **Agent Adapter Layer** — 抽象 Agent 执行接口（`agent.run({task, context, model})`），支持 OpenCode/Codex/Claude 多后端，未来可按任务自动选模型
+2. **Failure Recovery** — FAILED 任务自动分析失败原因、生成修复建议、支持自动重试（不盲试）
+3. **Human Approval Policy** — YAML 规则化人工审批（按风险类型: db/依赖/架构/删除 等决定是否必须人工确认）
 
-Before: 固定流程 Developer→Review→Verify; 状态只写 .htask/tasks/<id>.json 单文件; 任务产物散落项目根。
-After: `htask plan TASK.md` 输出分析建议; 状态迁移发事件(可订阅); 每任务产物归入 .htask/artifacts/<id>/。
+Before: 绑定 opencode; FAILED 只能人工介入; 审批只按状态机硬编码（VERIFYING→ACCEPTED 全都要 accept）。
+After: 可切换 agent 后端; FAILED 自动诊断+可重试; 低风险任务 advance 自动过闸、高风险必须人工。
 
 ## Context
 
-- 项目: ~/Project/hermes-task-runner（htask, 零依赖 node CLI, 当前 50 测试全绿, bin/htask.mjs 1125 行）
-- 现有: 状态机(STATES/TRANSITIONS/transition)、命令(start/status/accept/merge/advance/cancel/list/report)、JSON 输出、MERGE_EXCLUDE 保护
-- 状态文件: .htask/tasks/<id>.json + .htask/state.json(currentId 指针)
-- 演进蓝图: 见 Hermes_Task_Runner_演进建议.md（本 TASK 是阶段一: 特性 1/4/5, Dynamic Pipeline 并入 Planner）
+- 项目: ~/Project/hermes-task-runner（htask, 零依赖 node CLI, 当前 68 测试全绿, bin/htask.mjs 1402 行）
+- 已有: 状态机、10 命令(start/status/accept/merge/advance/cancel/list/report/plan/events)、JSON 输出、Artifact Bundle、Event System、Planner
+- 演进蓝图: Hermes_Task_Runner_演进建议.md 特性 3(Adapter)/6(Recovery)/7(Approval Policy)
+- 环境: opencode 在 /opt/homebrew/bin; Codex/Claude 未装（适配器需优雅降级提示）; 默认模型 deepseek/deepseek-v4-flash
 
 ## Current Behavior
 
-- `htask start` 直接跑固定流程: 解析→IMPLEMENTING→(REVIEWING)→VERIFYING, 无前置分析
-- 状态迁移只有文件写入, 无事件通知（外部无法实时感知）
-- 任务产物: REPORT.md 写项目根, REVIEW.md 写项目根, 日志在 .htask/logs/, 状态在 .htask/tasks/ — 分散
+- `spawnOpenCode` 硬编码 `opencode` 命令（HTASK_OPENCODE_CMD 可覆盖但无结构化适配层）
+- FAILED 终态后: 无自动分析, 只能人工看 REPORT.md + 手动重新 start
+- `advance` 对所有任务一视同仁: VERIFYING 全过 → 自动 ACCEPTED（不管风险高低）
 
 ## Expected Behavior
 
-### 1. Task Planner（`htask plan` 命令）
+### 1. Agent Adapter Layer
 
-`htask plan TASK.md` 分析任务并输出建议:
+**`.htask/agent.<name>.json` 适配器定义**（可扩展, 零依赖）:
 
 ```json
 {
-  "complexity": "high",           // low | medium | high
-  "risk": ["security", "database"],
-  "pipeline": ["architect", "developer", "security-reviewer", "tester"],
-  "estimated": { "files": 6, "minutes": 40 },
-  "suggestModel": "deepseek/deepseek-v4-flash",
-  "suggestReview": true
+  "name": "opencode",
+  "display": "OpenCode",
+  "available": true,
+  "runCmd": ["opencode", "run", "--pure"],
+  "modelFlag": "-m",
+  "agentFlag": "--agent",
+  "env": { "SHELL": "/bin/bash" }
 }
 ```
 
-规则引擎实现（零依赖, 纯规则, 不用 LLM——保持可测可离线）:
-- **complexity 判定**: 按 TASK.md 关键字与长度
-  - high: 含 "架构|重构|迁移|安全|认证|oauth|数据库|schema" 或 >3000 字
-  - medium: 含 "功能|接口|api|测试|工具" 或 1000-3000 字
-  - low: 其他
-- **risk**: 命中关键字集合——security(安全/认证/oauth/注入/权限), database(数据库/schema/迁移/migration), api(接口/api/路由), dependency(依赖/引入/require)
-- **pipeline 生成**（按 complexity/risk）:
-  - high → ["architect", "developer", "security-reviewer", "tester"]
-  - medium → ["developer", "reviewer", "tester"]
-  - low → ["developer", "tester"]
-  - risk 含 security → 插入 "security-reviewer"; 含 database → 插入 "schema-check"
-- **suggestReview**: complexity != low 或 risk 非空 → true
-- `htask plan --json` 输出纯 JSON; 无参数则分析当前 TASK.md
+**配置方式**: 环境变量 `HTASK_AGENT=opencode` 选择默认后端; `htask start --agent-backend codex` 单任务覆盖; 内置适配器表（opencode 可用, codex/claude 标记 available:false 并在选用时报清晰错误）。
 
-`htask start` 集成: 启动时自动调 Planner, 把 `plan` 结果写入任务状态（state.plan 字段）, 并据此:
-- suggestReview && 未显式 --no-review → 默认开 review
-- 打印一行: `📋 计划: complexity=high, risk=[security], pipeline=[architect,developer,...]`
+**`spawnOpenCode` 重构为 `runAgent(cwd, backend, args, prompt, logName)`**:
+- 查适配器表 → 无则报 `❌ agent 后端 'codex' 未安装 (可用: opencode)` 退出码 1
+- 用适配器的 runCmd + modelFlag/agentFlag 组装参数
+- 保留 HTASK_OPENCODE_CMD / HTASK_OPENCODE_ARGS_PREFIX 兼容（若设置则直接走原路径）
 
-### 2. Event System
+**`htask agents` 命令**: 列出可用/不可用后端及模型。
 
-**事件定义**（状态迁移 + 关键动作时发）:
+**`htask start --agent-backend <name>`**: 覆盖后端; 任务状态记录 `agentBackend` 字段。
 
-```
-task.created      {taskId, title}
-task.started      {taskId, status: "IMPLEMENTING"}
-task.review_failed {taskId}
-task.verifying    {taskId}
-task.waiting_human {taskId, reason: "accept" | "merge"}
-task.completed    {taskId, status: "MERGED" | "FAILED" | "CANCELLED"}
-```
+### 2. Failure Recovery
 
-**实现**:
-- `src/.../events.ts` 或 bin 内 `emitEvent(cwd, event)`:
-  - 追加到 `.htask/events.jsonl`（JSON Lines, 每行一个事件 {ts, type, ...payload}）
-  - 调用可选的订阅钩子: 若 `.htask/hooks/on-<type>` 存在且可执行, spawn 执行（参数=事件 JSON, cwd=项目根）
-  - 钩子执行失败仅 warn 不阻断
-- 在 `transition()` 内自动发事件（task.created 在 createTask, completed 在进 TERMINAL 态）
-- `htask events [--tail N]` 命令: 查看最近 N 条事件（默认 10, JSON Lines 输出）
+**`htask retry [--id <id>] [--fix]`**:
 
-**与通知集成**: cron/skill 层后续可用事件文件驱动; 本阶段只做事件产生 + 钩子机制 + 查看命令。
+- 无 `--fix`: 读取 FAILED 任务的 REPORT.md + .htask/implement.log 尾部 + verify 结果, 输出诊断:
+  ```
+  🔍 失败诊断: task-xxx (FAILED)
+  - 实现: exit 1 (120s)
+  - 验证: 3 条中 1 条失败 → npm test (exit 1)
+  - 日志尾部: <最后 15 行>
+  - 建议: 实现阶段失败 → 检查 TASK.md 是否明确; 验证失败 → 修复代码或调整验证命令
+  ```
+- 有 `--fix`: 用当前 agent 重新跑实现（新 session, 提示词包含失败上下文: 上次 exit code + 失败命令输出摘要 + "修复后重新实现, 不要重复已完成的部分"）, 任务状态从 FAILED → PLANNING → IMPLEMENTING 重新流转; 验证通过 → VERIFYING
+- `retry --fix` 前打印确认: `⚠️ 将重新运行 agent 修复, 确认? (y/N)` — 交互式确认或 `--yes` 跳过
+- 不改变历史: 原 FAILED 任务保留（history 追加一条 `FAILED → PLANNING (retry)`）, 不新建任务
 
-### 3. Artifact Bundle
+**事件**: retry 时发 `task.retrying {taskId}` 事件。
 
-**每任务独立产物目录** `.htask/artifacts/<taskId>/`:
+### 3. Human Approval Policy
 
-```
-.htask/artifacts/<taskId>/
-  TASK.md          # 任务定义副本 (start 时复制)
-  PLAN.md          # 若有 plan 输出 (JSON)
-  REVIEW.md        # reviewer 输出 (--review 时)
-  REPORT.md        # 验证报告
-  diff.patch       # merge 时 git diff 快照 (git diff HEAD~1..HEAD 或工作区)
-  metrics.json     # {durationMs, tokens?, iterations, model, agent}
-  timeline.json    # 状态迁移时间线 [{from,to,at,by}]
+**`.htask/approval.yaml`**（可选配置, 不存在时用默认）:
+
+```yaml
+# 风险类型 → 是否需要人工确认。默认全部需要(保守)。
+rules:
+  high_risk: true        # 默认 true — 高风险任务必须人工 accept
+  low_risk: false        # 低风险任务 advance 可自动过闸
+# 判定: 复用 Planner 的 risk 输出。risk 非空 → high_risk; 空 → low_risk
 ```
 
-**改动**:
-- `createTask`: 建 artifacts/<id>/ 目录, 复制 TASK.md
-- `writeReport`: 同时写项目根 REPORT.md（兼容现有）和 artifacts/<id>/REPORT.md
-- `cmdStart` 的 REVIEWING 阶段: reviewer 输出的 REVIEW.md 复制到 artifacts/<id>/（若生成）
-- `doMerge`: commit 前生成 diff.patch（git diff 工作区 vs HEAD 或上次 commit）
-- `transition`: 更新 artifacts/<id>/timeline.json（与 tasks/<id>.json 的 history 同步, 冗余一份供复盘）
-- `cmdStatus --json` / `list --json`: 增加 `artifactDir` 字段
-- metrics.json 在 MERGED/FAILED 时写入（durationMs 从 startedAt 算, model/agent 从任务字段）
+**行为**:
+- `advance` 时: 读 approval 配置 + 任务的 plan.risk
+  - 任务无 risk（low）且配置 low_risk:false → **自动过闸**: VERIFYING → ACCEPTED → MERGED 全程无需人工
+  - 任务有 risk（high）或配置 high_risk:true → 停在 VERIFYING 等 accept（现有行为）
+- `accept` 行为不变（人工显式确认始终有效）
+- 无 approval.yaml 时默认: 全部需人工（保守, 向后兼容现有行为）
 
-**兼容**: 保留现有 .htask/tasks/<id>.json 为唯一状态源; artifacts/ 是衍生产物, 可随时删（下次状态变更重建）。
+**`htask policy` 命令**: 显示当前审批策略 + 解释（读配置或默认）。
+
+**plan 输出扩展**: `plan` 增加 `approval: "auto" | "human"` 字段（按 risk + 策略判定）。
 
 ## Files
 
-- 修改: `bin/htask.mjs`（Planner 规则 + emitEvent + artifact 逻辑 + plan/events 命令）
+- 修改: `bin/htask.mjs`（runAgent 重构 + cmdRetry + cmdAgents + cmdPolicy + approval 逻辑 + plan 扩展）
 - 修改: `test/htask.test.mjs`（新增测试）
-- 修改: `README.md`（plan/events/artifacts 用法）
-- 新增: `.htask/hooks/` 目录示例说明（README）
+- 修改: `README.md`（agent 后端/retry/policy 用法 + .htask/approval.yaml 示例）
+- 新增（测试用）: 内置适配器表常量
 
 ## Constraints
 
-- 零 npm 依赖、单文件 CLI 不变（Planner 用纯规则, 不调 LLM）
-- Event 钩子 spawn 失败只 warn; events.jsonl 追加写（appendFileSync）
-- Artifact 目录与状态文件解耦: 删 artifacts/ 不破坏任务状态; 状态变更自动重建缺失产物
-- 向后兼容: 现有命令/JSON 输出字段不破坏（只增字段）
-- 现有 50 测试不回归
-- 中文输出风格一致
+- 零 npm 依赖、单文件 CLI
+- 适配器抽象必须向后兼容: 不设 HTASK_AGENT 时行为与现在完全一致（默认 opencode）
+- retry 不破坏历史: 原任务 id/历史保留, 只追加迁移
+- approval.yaml 解析失败 → warn + 走默认（全部人工, 保守）
+- 未安装的后端（codex/claude）报清晰错误, 不尝试执行
+- 现有 68 测试不回归
 
 ## Acceptance Criteria
 
-1. `node --check` + 全量测试绿（新增: Planner 复杂度/风险/pipeline 规则各分支、plan --json 输出、events 文件追加+钩子触发+events 命令、artifact 目录创建+REPORT/diff/metrics/timeline 生成、start 集成 plan 字段）
-2. `htask plan TASK.md` 对高复杂度任务输出含 security-reviewer 的 pipeline
-3. 跑一次 start（假 opencode）→ .htask/events.jsonl 有 task.created/started/verifying/waiting_human 事件; .htask/artifacts/<id>/ 有 TASK.md/REPORT.md/metrics.json/timeline.json
-4. `htask events --tail 3` 正常输出
-5. README 更新
+1. `node --check` + 全量测试绿（新增: 适配器解析/未知后端报错/默认 opencode、retry 诊断输出/retry --fix 状态流转/事件、approval 配置解析/自动过闸/保守默认/plan.approval 字段）
+2. `htask agents` 列出 opencode 可用 + codex/claude 不可用
+3. `htask plan --json` 对无 risk 任务输出 approval:"auto"（配 low_risk:false 时）
+4. 端到端: 低风险任务（无 risk）advance 一次自动 MERGED（无人工闸门）; 高风险任务 advance 停在 VERIFYING
+5. `htask retry` 对 FAILED 任务输出诊断; `retry --fix --yes` 重新流转并（假 agent）验证通过 → VERIFYING
+6. README 更新
 
 ## Verification Commands
 
@@ -141,5 +128,5 @@ node --test "test/*.test.mjs"
 
 ## Rollback Plan
 
-- `git revert` 该 commit（htask 独立仓库）
-- artifacts/ 与 events.jsonl 是新增数据, 删除即回退; 状态机核心未动
+- `git revert` 该 commit
+- 新增配置（approval.yaml）删除即回退默认保守行为; retry/agents/policy 是增量命令

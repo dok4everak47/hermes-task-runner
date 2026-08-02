@@ -5,7 +5,7 @@
 // 零 npm 依赖: 只用 node 内置模块。
 
 import { spawn, spawnSync } from 'node:child_process';
-import { accessSync, appendFileSync, constants, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,7 +43,7 @@ export const TRANSITIONS = {
   VERIFYING: ['ACCEPTED', 'FAILED', 'CANCELLED'],
   ACCEPTED: ['MERGED', 'CANCELLED'],
   MERGED: [],
-  FAILED: [],
+  FAILED: ['PLANNING'], // retry --fix: 允许从终态回到规划重新实现
   CANCELLED: [],
 };
 
@@ -316,6 +316,7 @@ export async function createTask(cwd, meta) {
     title: meta.title ?? '未知任务',
     status: 'CREATED',
     agent: meta.agent ?? null,
+    agentBackend: meta.agentBackend ?? null,
     model: meta.model ?? DEFAULT_MODEL,
     taskFile: meta.taskFile ?? 'TASK.md',
     plan: null,
@@ -350,6 +351,7 @@ export async function transition(cwd, id, to, by = 'auto') {
   task.history.push({ from, to, at: new Date().toISOString(), by });
   task.status = to;
   task.updatedAt = new Date().toISOString();
+  if (TERMINAL.has(from)) task.endedAt = null; // 离开终态 (retry) 清除结束时间
   if (TERMINAL.has(to)) task.endedAt = task.endedAt ?? task.updatedAt;
   await writeTask(cwd, task);
   await writeTimeline(cwd, task);
@@ -552,12 +554,10 @@ export function buildOpenCodeArgs({ model, agent } = {}) {
   return args;
 }
 
-// spawn opencode 后台运行, stdout/stderr 追加到 .htask/<logName>, 退出时 resolve
-export function spawnOpenCode(cwd, args, prompt, logName = 'implement.log') {
+// 通用 agent spawn: 命令/输出追加到 .htask/<logName>, 退出时 resolve {exitCode, durationMs}
+function spawnAgentCmd(cwd, cmd, fullArgs, logName, extraEnv = {}) {
   return new Promise((resolve) => {
-    const cmd = process.env.HTASK_OPENCODE_CMD || 'opencode';
     const logPath = path.join(cwd, '.htask', logName);
-    const fullArgs = [...args, prompt];
     const start = Date.now();
     let settled = false;
 
@@ -581,9 +581,9 @@ export function spawnOpenCode(cwd, args, prompt, logName = 'implement.log') {
     const child = spawn(cmd, fullArgs, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      // opencode 内部跑命令用 $SHELL; zsh 加载 .zshrc 会产生 direnv/zoxide/starship 噪音
+      // agent 内部跑命令用 $SHELL; zsh 加载 .zshrc 会产生 direnv/zoxide/starship 噪音
       // (nix shell PATH 下找不到) — 统一用 bash, 输出干净
-      env: { ...process.env, SHELL: process.env.HTASK_SHELL || '/bin/bash' },
+      env: { ...process.env, SHELL: process.env.HTASK_SHELL || '/bin/bash', ...extraEnv },
     });
     child.stdout?.on('data', (d) => {
       try {
@@ -609,6 +609,105 @@ export function spawnOpenCode(cwd, args, prompt, logName = 'implement.log') {
     });
     child.on('close', (code) => finish(code ?? -1));
   });
+}
+
+// 兼容层: 直接跑 opencode 命令 (HTASK_OPENCODE_CMD / ARGS_PREFIX 走原路径)
+export function spawnOpenCode(cwd, args, prompt, logName = 'implement.log') {
+  const cmd = process.env.HTASK_OPENCODE_CMD || 'opencode';
+  return spawnAgentCmd(cwd, cmd, [...args, prompt], logName);
+}
+
+// ---------- Agent Adapter Layer ----------
+
+// 内置适配器表 (可扩展): 多后端抽象, 未安装的后端标 available:false, 选用时报清晰错误。
+// 自定义适配器: .htask/agent.<name>.json 覆盖内置同名条目 (零依赖, JSON 定义)。
+export const AGENT_ADAPTERS = {
+  opencode: {
+    name: 'opencode',
+    display: 'OpenCode',
+    available: true,
+    runCmd: ['opencode', 'run', '--pure'],
+    modelFlag: '-m',
+    agentFlag: '--agent',
+    env: { SHELL: '/bin/bash' },
+  },
+  codex: {
+    name: 'codex',
+    display: 'Codex',
+    available: false,
+    runCmd: ['codex', 'exec'],
+    modelFlag: '-m',
+    agentFlag: null,
+    env: {},
+  },
+  claude: {
+    name: 'claude',
+    display: 'Claude',
+    available: false,
+    runCmd: ['claude'],
+    modelFlag: '--model',
+    agentFlag: null,
+    env: {},
+  },
+};
+
+export function availableAgentNames() {
+  return Object.keys(AGENT_ADAPTERS).filter((k) => AGENT_ADAPTERS[k].available);
+}
+
+// 读 .htask/agent.<name>.json 自定义适配器 (存在才返回, 否则 null)
+export function loadCustomAgentAdapter(cwd, name) {
+  try {
+    const raw = readFileSync(path.join(cwd, '.htask', `agent.${name}.json`), 'utf8');
+    const def = JSON.parse(raw);
+    if (def && typeof def === 'object' && def.name) return def;
+  } catch {
+    /* 无自定义适配器 */
+  }
+  return null;
+}
+
+// 查适配器表 (自定义优先), 未知返回 null
+export function getAgentAdapter(cwd, name) {
+  return loadCustomAgentAdapter(cwd, name) || AGENT_ADAPTERS[name] || null;
+}
+
+// 校验后端可用性: 返回 { ok, backend, adapter } 或 { ok:false, backend, error }
+export function resolveAgentBackend(cwd, explicit) {
+  const backend = explicit || process.env.HTASK_AGENT || 'opencode';
+  const adapter = getAgentAdapter(cwd, backend);
+  if (!adapter) return { ok: false, backend, error: 'unknown' };
+  if (!adapter.available) return { ok: false, backend, error: 'unavailable' };
+  return { ok: true, backend, adapter };
+}
+
+function reportAgentUnavailable(backend) {
+  console.error(`❌ agent 后端 '${backend}' 未安装 (可用: ${availableAgentNames().join(', ')})`);
+  process.exitCode = 1;
+}
+
+// 按适配器组装参数: runCmd + modelFlag/agentFlag + prompt
+export function buildAgentArgs(adapter, { model, agent } = {}) {
+  const args = [...adapter.runCmd];
+  if (model) args.push(adapter.modelFlag, model);
+  if (agent && adapter.agentFlag) args.push(adapter.agentFlag, agent);
+  return args;
+}
+
+// 统一 agent 执行入口: 查适配器表 → 组装参数 → spawn 并追加日志。
+// 未安装后端 → 清晰报错 (退出码 1), 不尝试执行。
+// HTASK_OPENCODE_CMD / HTASK_OPENCODE_ARGS_PREFIX 设置时直接走原 opencode 路径 (向后兼容)。
+export async function runAgent(cwd, backend, { model, agent } = {}, prompt, logName = 'implement.log') {
+  if (process.env.HTASK_OPENCODE_CMD || process.env.HTASK_OPENCODE_ARGS_PREFIX) {
+    return spawnOpenCode(cwd, buildOpenCodeArgs({ model, agent }), prompt, logName);
+  }
+  const adapter = getAgentAdapter(cwd, backend);
+  if (!adapter || !adapter.available) {
+    reportAgentUnavailable(backend);
+    return { exitCode: -1, durationMs: 0, error: 'unavailable' };
+  }
+  const fullArgs = [...buildAgentArgs(adapter, { model, agent }), prompt];
+  return spawnAgentCmd(cwd, adapter.runCmd[0], fullArgs, logName, adapter.env);
 }
 
 // ---------- 验证 ----------
@@ -721,10 +820,17 @@ export async function writeReport(cwd, ctx) {
 
 // ---------- 命令: start ----------
 
-export async function cmdStart({ cwd, taskFile, model, agent, review, id, noReview }) {
+export async function cmdStart({ cwd, taskFile, model, agent, review, id, noReview, agentBackend }) {
   const ht = path.join(cwd, '.htask');
   const lock = path.join(ht, 'state.lock');
   await mkdir(ht, { recursive: true });
+
+  // 校验 agent 后端可用性 (未安装/未知 → 清晰报错, 不创建任务)
+  const backend = resolveAgentBackend(cwd, agentBackend);
+  if (!backend.ok) {
+    reportAgentUnavailable(backend.backend);
+    return { ok: false, reason: 'agent-unavailable' };
+  }
 
   if (existsSync(lock)) {
     console.error('❌ 已有任务在运行 (.htask/state.lock 存在), 请等待完成或删除锁文件');
@@ -750,6 +856,7 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
       title,
       model: model ?? DEFAULT_MODEL,
       agent,
+      agentBackend: backend.backend,
       taskFile: path.basename(taskFile),
     });
 
@@ -780,14 +887,21 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     }
     const { verifyCommands } = parseTaskFile(md);
 
-    // 3. IMPLEMENTING → spawn opencode
+    // 3. IMPLEMENTING → spawn agent
     await transition(cwd, task.id, 'PLANNING', 'auto');
     await transition(cwd, task.id, 'IMPLEMENTING', 'auto');
     emitEvent(cwd, { type: 'task.started', taskId: task.id, status: 'IMPLEMENTING' });
-    console.log(`▶️  启动实现: ${path.basename(taskFile)} (model=${task.model}${agent ? `, agent=${agent}` : ''})`);
-    const args = buildOpenCodeArgs({ model, agent });
+    console.log(
+      `▶️  启动实现: ${path.basename(taskFile)} (model=${task.model}${agent ? `, agent=${agent}` : ''}${backend.backend !== 'opencode' ? `, backend=${backend.backend}` : ''})`
+    );
     const logName = `logs/${task.id}.log`;
-    const implement = await spawnOpenCode(cwd, args, `按 ${path.basename(taskFile)} 实现，完成后总结`, logName);
+    const implement = await runAgent(
+      cwd,
+      backend.backend,
+      { model, agent },
+      `按 ${path.basename(taskFile)} 实现，完成后总结`,
+      logName
+    );
     task = await readTask(cwd, task.id);
     task.implementExit = implement.exitCode;
     task.implementDurationMs = implement.durationMs;
@@ -795,13 +909,13 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
     await writeTask(cwd, task);
 
     notify(
-      implement.exitCode === 0 ? '✅ OpenCode 完成' : '❌ OpenCode 失败',
+      implement.exitCode === 0 ? '✅ Agent 完成' : '❌ Agent 失败',
       `exit ${implement.exitCode} · 耗时 ${fmtDuration(implement.durationMs)}`
     );
 
     if (implement.exitCode !== 0) {
       await transition(cwd, task.id, 'FAILED', 'auto');
-      console.error(`❌ opencode 退出码 ${implement.exitCode}, 任务已 FAILED (日志: .htask/${logName})`);
+      console.error(`❌ agent 退出码 ${implement.exitCode}, 任务已 FAILED (日志: .htask/${logName})`);
       await writeReport(cwd, await readTask(cwd, task.id));
       return { ok: false, reason: 'implement-failed' };
     }
@@ -811,9 +925,10 @@ export async function cmdStart({ cwd, taskFile, model, agent, review, id, noRevi
       await transition(cwd, task.id, 'REVIEWING', 'auto');
       console.log('🧐 运行 reviewer agent...');
       const revLog = `logs/${task.id}.review.log`;
-      const rev = await spawnOpenCode(
+      const rev = await runAgent(
         cwd,
-        buildOpenCodeArgs({ model, agent: 'reviewer' }),
+        backend.backend,
+        { model, agent: 'reviewer' },
         '按 .templates/REVIEW.md 模板独立验收本次实现并生成 REVIEW.md',
         revLog
       );
@@ -1041,8 +1156,30 @@ export async function cmdAdvance({ cwd, id, noPush, json = false }) {
       }
       return { ok: false, reason: 'verify-failed' };
     }
+    // 审批策略闸门: 仅对 Planner 分析过的任务 (有 plan.risk) 生效;
+    // 无 plan (旧任务/手工构造) 保持原自动推进行为 (向后兼容)。
+    if (task.plan) {
+      const policy = await loadApprovalPolicy(cwd);
+      const approval = approvalDecision({ risk: task.plan.risk ?? [], policy });
+      if (approval === 'human') {
+        const risky = (task.plan.risk ?? []).length > 0;
+        const msg = `⏸ ${task.id} 停在 VERIFYING: ${risky ? '高风险任务' : '低风险但策略需人工'} 请运行 htask accept`;
+        if (json) {
+          console.log(
+            JSON.stringify(
+              { id: task.id, status: 'VERIFYING', state: 'WAITING_HUMAN', action: 'none', message: msg },
+              null,
+              2
+            )
+          );
+        } else {
+          out(msg);
+        }
+        return { ok: true, action: 'none' };
+      }
+    }
     await transition(cwd, task.id, 'ACCEPTED', 'auto');
-    out(`✅ ${task.id}: VERIFYING → ACCEPTED`);
+    out(`✅ ${task.id}: VERIFYING → ACCEPTED${task.plan ? ' (自动过闸)' : ''}`);
     // 落到 ACCEPTED 分支继续
   }
 
@@ -1087,6 +1224,164 @@ export async function cmdCancel({ cwd, id }) {
   return { ok: true };
 }
 
+// ---------- 命令: retry (Failure Recovery) ----------
+
+// 读取失败日志尾部 (最后 N 行, 优先任务专属日志, 回退 implement.log)
+function readLogTail(cwd, taskId, n = 15) {
+  const candidates = [path.join(cwd, '.htask', 'logs', `${taskId}.log`), path.join(cwd, '.htask', 'implement.log')];
+  for (const p of candidates) {
+    try {
+      const lines = readFileSync(p, 'utf8').split('\n').filter((l) => l.trim().length > 0);
+      if (lines.length > 0) return lines.slice(-n);
+    } catch {
+      /* 尝试下一个 */
+    }
+  }
+  return [];
+}
+
+// 无 --fix: 输出失败诊断 (实现/验证/日志尾部/建议)
+export function printDiagnosis(cwd, task) {
+  const failedVerify = (task.verify ?? []).filter((r) => r.exitCode !== 0);
+  console.log(`🔍 失败诊断: ${task.id} (FAILED)`);
+  console.log(`- 实现: exit ${task.implementExit ?? '-'} (${fmtDuration(task.implementDurationMs)})`);
+  if ((task.verify ?? []).length === 0) {
+    console.log('- 验证: (未执行)');
+  } else if (failedVerify.length === 0) {
+    console.log(`- 验证: ${task.verify.length} 条全部通过`);
+  } else {
+    const first = failedVerify[0];
+    console.log(`- 验证: ${task.verify.length} 条中 ${failedVerify.length} 条失败 → ${first.command} (exit ${first.exitCode})`);
+  }
+  const tail = readLogTail(cwd, task.id);
+  if (tail.length === 0) {
+    console.log('- 日志尾部: (无日志)');
+  } else {
+    console.log(`- 日志尾部: ${tail[0]}`);
+    for (const l of tail.slice(1)) console.log(`  ${l}`);
+  }
+  const advice = [];
+  if (task.implementExit != null && task.implementExit !== 0) advice.push('实现阶段失败 → 检查 TASK.md 是否明确');
+  if (failedVerify.length > 0) advice.push('验证失败 → 修复代码或调整验证命令');
+  console.log(`- 建议: ${advice.join('; ') || '检查任务状态与日志'}`);
+  console.log('运行 htask retry --fix 自动修复, 或人工介入');
+}
+
+// retry --fix 的提示词: 携带上次失败上下文 (exit code + 失败命令输出摘要)
+function buildRetryPrompt(task) {
+  const lines = [`按 ${task.taskFile} 重新实现 (上次失败, 修复模式)。`, '', '## 上次失败上下文'];
+  if (task.implementExit != null) {
+    lines.push(`- 上次实现退出码: ${task.implementExit} (耗时 ${fmtDuration(task.implementDurationMs)})`);
+  }
+  const failedVerify = (task.verify ?? []).filter((r) => r.exitCode !== 0);
+  if (failedVerify.length > 0) {
+    lines.push('- 失败验证:');
+    for (const r of failedVerify) {
+      lines.push(`  - ${r.command} (exit ${r.exitCode})`);
+      for (const o of String(r.output ?? '').split('\n').slice(0, 10)) {
+        if (o.trim()) lines.push(`    ${o}`);
+      }
+    }
+  }
+  lines.push('', '请诊断失败原因并修复后重新实现, 不要重复已完成的部分, 完成后总结。');
+  return lines.join('\n');
+}
+
+// 交互式 y/N 确认; 非 TTY 直接返回空 (视为取消)
+function readStdinLine() {
+  return new Promise((resolve) => {
+    if (!process.stdin || !process.stdin.isTTY) return resolve('');
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    const onData = (d) => {
+      data += d;
+      if (data.includes('\n')) {
+        process.stdin.removeListener('data', onData);
+        resolve(data);
+      }
+    };
+    process.stdin.on('data', onData);
+    process.stdin.resume();
+  });
+}
+
+// htask retry [--id <id>] [--fix] [--yes]:
+//   无 --fix → 诊断输出; 有 --fix → 用当前 agent 重新实现, FAILED → PLANNING → IMPLEMENTING 重流转
+export async function cmdRetry({ cwd, id, fix, yes }) {
+  const task = await resolveTask(cwd, id);
+  if (!task) return { ok: false, reason: 'no-task' };
+  if (task.status !== 'FAILED') {
+    console.error(`❌ 只能重试 FAILED 任务 (当前 ${task.status})`);
+    process.exitCode = 1;
+    return { ok: false, reason: 'wrong-state' };
+  }
+  emitEvent(cwd, { type: 'task.retrying', taskId: task.id });
+
+  if (!fix) {
+    printDiagnosis(cwd, task);
+    return { ok: true };
+  }
+
+  if (!yes) {
+    console.error('⚠️ 将重新运行 agent 修复, 确认? (y/N)');
+    const ans = await readStdinLine();
+    if (!/^y(es)?$/i.test(String(ans).trim())) {
+      console.log('已取消');
+      return { ok: false, reason: 'aborted' };
+    }
+  }
+
+  // FAILED → PLANNING (retry) → IMPLEMENTING 重新流转 (历史追加, 不新建任务)
+  await transition(cwd, task.id, 'PLANNING', 'retry');
+  await transition(cwd, task.id, 'IMPLEMENTING', 'auto');
+  emitEvent(cwd, { type: 'task.started', taskId: task.id, status: 'IMPLEMENTING' });
+
+  const backend = task.agentBackend || process.env.HTASK_AGENT || 'opencode';
+  const logName = `logs/${task.id}.log`;
+  const implement = await runAgent(cwd, backend, { model: task.model, agent: task.agent }, buildRetryPrompt(task), logName);
+  let cur = await readTask(cwd, task.id);
+  cur.implementExit = implement.exitCode;
+  cur.implementDurationMs = implement.durationMs;
+  cur.updatedAt = new Date().toISOString();
+  await writeTask(cwd, cur);
+
+  if (implement.exitCode !== 0) {
+    await transition(cwd, task.id, 'FAILED', 'auto');
+    console.error(`❌ agent 退出码 ${implement.exitCode}, 任务仍 FAILED (日志: .htask/${logName})`);
+    await writeReport(cwd, await readTask(cwd, task.id));
+    return { ok: false, reason: 'implement-failed' };
+  }
+
+  // 重新验证 (沿用任务 TASK.md 的 Verification Commands)
+  let verifyCommands = [];
+  try {
+    const taskFile = path.isAbsolute(task.taskFile) ? task.taskFile : path.join(cwd, task.taskFile);
+    verifyCommands = parseTaskFile(await readFile(taskFile, 'utf8')).verifyCommands;
+  } catch {
+    /* 读取失败用默认验证 */
+  }
+  const commands = verifyCommands.length > 0 ? verifyCommands : DEFAULT_VERIFY;
+  console.log('🔍 重新验证...');
+  const verify = await runVerifyCommands(cwd, commands);
+  cur = await readTask(cwd, task.id);
+  cur.verify = verify;
+  cur.verification = verificationSummary(verify);
+  cur.updatedAt = new Date().toISOString();
+  await writeTask(cwd, cur);
+
+  const allPass = verify.every((r) => r.exitCode === 0);
+  if (allPass) {
+    await transition(cwd, task.id, 'VERIFYING', 'auto');
+    console.log('✅ 验证全过, 任务回到 VERIFYING, 下一步: htask advance / accept');
+    emitEvent(cwd, { type: 'task.verifying', taskId: task.id });
+  } else {
+    await transition(cwd, task.id, 'FAILED', 'auto');
+    console.error('❌ 验证仍有失败项, 任务仍 FAILED');
+  }
+  await writeReport(cwd, await readTask(cwd, task.id));
+  return { ok: allPass, reason: allPass ? null : 'verify-failed' };
+}
+
 // ---------- 命令: status / list ----------
 
 // 单任务 JSON 序列化 (供 status --json)
@@ -1100,6 +1395,7 @@ export function taskToJson(task) {
     taskFile: task.taskFile,
     model: task.model,
     agent: task.agent ?? null,
+    agentBackend: task.agentBackend ?? null,
     review: task.review ?? null,
     verification: task.verification ?? verificationSummary(task.verify ?? []),
     verify: (task.verify ?? []).map((r) => ({ command: r.command, exitCode: r.exitCode })),
@@ -1235,6 +1531,103 @@ export async function cmdReport({ cwd }) {
   console.log('📝 REPORT.md 已根据已有状态重新生成');
 }
 
+// ---------- Human Approval Policy ----------
+
+// .htask/approval.yaml (可选, 零依赖 YAML 子集解析): rules.high_risk / rules.low_risk。
+// 不存在或解析失败 → 默认全部需人工 (保守, 向后兼容)。
+//   规则: risk 非空 → high_risk; risk 空 → low_risk
+//   rule 为 true → human (advance 停在 VERIFYING 等 accept); false → auto (advance 自动过闸)
+export async function loadApprovalPolicy(cwd) {
+  const defaults = { high_risk: true, low_risk: true };
+  let text;
+  try {
+    text = await readFile(path.join(cwd, '.htask', 'approval.yaml'), 'utf8');
+  } catch {
+    return { rules: { ...defaults }, source: 'default' };
+  }
+  try {
+    const parsed = parseApprovalYaml(text);
+    return { rules: { ...defaults, ...parsed }, source: 'file' };
+  } catch (err) {
+    console.warn(`⚠️ 解析 approval.yaml 失败, 使用默认 (全部人工): ${err.message}`);
+    return { rules: { ...defaults }, source: 'default' };
+  }
+}
+
+// 解析 YAML 子集: 支持 "key: value" 与 "rules:" 段下的缩进项; 值支持 true/false/数字/字符串/#注释
+export function parseApprovalYaml(text) {
+  const rules = {};
+  let inRules = false;
+  for (const raw of String(text).split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    if (line.startsWith('rules:')) {
+      const rest = line.slice('rules:'.length).trim();
+      if (rest && rest !== '{}') throw new Error(`无效的 rules 行: ${line}`);
+      inRules = true;
+      continue;
+    }
+    if (!inRules) continue;
+    const m = line.match(/^([a-zA-Z0-9_]+):\s*(.*)$/);
+    if (m) rules[m[1]] = parseYamlScalar(m[2]);
+  }
+  return rules;
+}
+
+function parseYamlScalar(v) {
+  const s = String(v).trim();
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  const n = Number(s);
+  if (s !== '' && Number.isFinite(n)) return n;
+  return s.replace(/^["']|["']$/g, '');
+}
+
+// 判定单任务/单 plan 审批级别: risk 非空 → high_risk 规则; 空 → low_risk 规则
+export function approvalDecision({ risk = [], policy }) {
+  const rule = risk.length > 0 ? policy.rules.high_risk : policy.rules.low_risk;
+  return rule ? 'human' : 'auto';
+}
+
+// ---------- 命令: policy ----------
+
+// htask policy: 显示当前审批策略 + 解释 (读 .htask/approval.yaml 或默认)
+export async function cmdPolicy({ cwd }) {
+  const policy = await loadApprovalPolicy(cwd);
+  const fmt = (b) => (b ? '需人工 accept' : 'advance 自动过闸');
+  console.log(`审批策略 (来源: ${policy.source === 'file' ? '.htask/approval.yaml' : '默认, 无 approval.yaml (保守)'}):`);
+  console.log(`  - 高风险 (有 risk): ${fmt(policy.rules.high_risk)}`);
+  console.log(`  - 低风险 (无 risk): ${fmt(policy.rules.low_risk)}`);
+  console.log('说明: htask advance 时判定; accept 人工显式确认始终有效。');
+  console.log('配置: .htask/approval.yaml → rules: { high_risk: true/false, low_risk: true/false }');
+}
+
+// ---------- 命令: agents ----------
+
+// htask agents: 列出可用/不可用后端 (内置 + .htask/agent.<name>.json 自定义)
+export async function cmdAgents({ cwd }) {
+  const names = new Set(Object.keys(AGENT_ADAPTERS));
+  try {
+    for (const f of await readdir(path.join(cwd, '.htask'))) {
+      const m = f.match(/^agent\.(.+)\.json$/);
+      if (m) names.add(m[1]);
+    }
+  } catch {
+    /* 无 .htask 目录 */
+  }
+  console.log('Agent 后端:');
+  for (const name of [...names].sort()) {
+    const a = getAgentAdapter(cwd, name);
+    if (a?.available) {
+      console.log(`  ✅ ${name}  ${a.display ?? name}`);
+    } else {
+      console.log(`  ❌ ${name}  ${a?.display ?? name} (未安装)`);
+    }
+  }
+  console.log(`默认后端: ${process.env.HTASK_AGENT || 'opencode'} (HTASK_AGENT 或 --agent-backend 覆盖)`);
+  console.log(`默认模型: ${DEFAULT_MODEL}`);
+}
+
 // ---------- 命令: plan ----------
 
 // htask plan [TASK.md] [--json]: 纯规则分析复杂度/风险/推荐 pipeline (不用 LLM)
@@ -1250,11 +1643,14 @@ export async function cmdPlan({ cwd, taskFile, json }) {
     return { ok: false, reason: 'read-error' };
   }
   const plan = analyzeTask(md);
+  const policy = await loadApprovalPolicy(cwd);
+  plan.approval = approvalDecision({ risk: plan.risk, policy });
   if (json) {
     console.log(JSON.stringify(plan, null, 2));
   } else {
     console.log(`复杂度: ${plan.complexity}`);
     console.log(`风险: ${plan.risk.length > 0 ? plan.risk.join(', ') : '无'}`);
+    console.log(`审批: ${plan.approval === 'auto' ? 'auto (advance 自动过闸)' : 'human (advance 停在 VERIFYING)'}`);
     console.log(`推荐 pipeline: ${plan.pipeline.join(' → ')}`);
     console.log(`预计: ${plan.estimated.files} 文件 / ${plan.estimated.minutes} 分钟`);
     console.log(`建议模型: ${plan.suggestModel}`);
@@ -1293,25 +1689,31 @@ function printHelp() {
 
 用法:
   htask plan [TASK.md] [--json]
-  htask start [--model <provider/model>] [--agent <agent>] [--review] [--no-review] [--id <id>] [TASK.md]
+  htask start [--model <provider/model>] [--agent <agent>] [--agent-backend <name>] [--review] [--no-review] [--id <id>] [TASK.md]
   htask status [--id <id> | --all] [--json]
   htask list [--json]
   htask accept [--id <id>]
   htask merge [--id <id>] [--no-push]
   htask advance [--id <id>] [--no-push] [--json]
+  htask retry [--id <id>] [--fix] [--yes]
   htask cancel [--id <id>]
+  htask agents
+  htask policy
   htask events [--tail N]
   htask report
   htask --help
 
 选项:
   --model <provider/model>   覆盖模型 (默认 ${DEFAULT_MODEL})
-  --agent <agent>            指定 opencode agent
+  --agent <agent>            指定 agent
+  --agent-backend <name>     覆盖 agent 后端 (默认 HTASK_AGENT 或 opencode; 可用: ${availableAgentNames().join(', ')})
   --review                   验证通过后运行 reviewer agent 生成 REVIEW.md
   --no-review                关闭 Planner 建议的自动 review
   --id <id>                  指定任务 id (默认当前任务)
   --all                      列出所有任务
   --no-push                  merge/advance 时跳过 git push
+  --fix                      retry 时用 agent 自动修复重实现
+  --yes                      retry --fix 跳过确认
   --json                     plan/status/list/advance 输出 JSON (可 JSON.parse)
   --tail N                   events 查看最近 N 条 (默认 10)
   advance                    自动推进可自动的迁移: VERIFYING(全过)→ACCEPTED→MERGED
@@ -1319,6 +1721,8 @@ function printHelp() {
 环境变量 (测试注入):
   HTASK_OPENCODE_CMD          opencode 命令 (默认 opencode)
   HTASK_OPENCODE_ARGS_PREFIX  参数前缀 (默认 "run --pure -m ${DEFAULT_MODEL}")
+  HTASK_AGENT                 默认 agent 后端 (默认 opencode)
+  HTASK_SHELL                 agent 内部命令 shell (默认 /bin/bash)
 `);
 }
 
@@ -1333,11 +1737,14 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
     const a = rest[i];
     if (a === '--model') opts.model = rest[++i];
     else if (a === '--agent') opts.agent = rest[++i];
+    else if (a === '--agent-backend') opts.agentBackend = rest[++i];
     else if (a === '--review') opts.review = true;
     else if (a === '--no-review') opts.noReview = true;
     else if (a === '--id') opts.id = rest[++i];
     else if (a === '--all') opts.all = true;
     else if (a === '--no-push') opts.noPush = true;
+    else if (a === '--fix') opts.fix = true;
+    else if (a === '--yes') opts.yes = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--tail') opts.tail = rest[++i];
     else opts.taskFile = a;
@@ -1348,7 +1755,7 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
       await cmdPlan({ cwd, taskFile: opts.taskFile, json: opts.json });
       break;
     case 'start':
-      await cmdStart({ cwd, taskFile: opts.taskFile || 'TASK.md', model: opts.model, agent: opts.agent, review: opts.review, noReview: opts.noReview, id: opts.id });
+      await cmdStart({ cwd, taskFile: opts.taskFile || 'TASK.md', model: opts.model, agent: opts.agent, review: opts.review, noReview: opts.noReview, id: opts.id, agentBackend: opts.agentBackend });
       break;
     case 'status':
       await cmdStatus({ cwd, id: opts.id, all: opts.all, json: opts.json });
@@ -1365,8 +1772,17 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd() }
     case 'advance':
       await cmdAdvance({ cwd, id: opts.id, noPush: opts.noPush, json: opts.json });
       break;
+    case 'retry':
+      await cmdRetry({ cwd, id: opts.id, fix: opts.fix, yes: opts.yes });
+      break;
     case 'cancel':
       await cmdCancel({ cwd, id: opts.id });
+      break;
+    case 'agents':
+      await cmdAgents({ cwd });
+      break;
+    case 'policy':
+      await cmdPolicy({ cwd });
       break;
     case 'events':
       await cmdEvents({ cwd, tail: opts.tail });
